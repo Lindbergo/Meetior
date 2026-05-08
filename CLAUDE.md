@@ -144,6 +144,126 @@ Local dev fallback model dir: `./models/parakeet-tdt-0.6b-v3/`.
 
 ---
 
+## Build, test, iterate
+
+The shortest path to "is my change correct?" — use the cheapest tool that
+gives a real answer. Don't run the full app to verify backend logic; don't
+restart Tauri to verify a CSS tweak.
+
+### Dev loops, ranked by cost
+
+| Loop | Cost | Use when |
+|---|---|---|
+| `pnpm check` | <2 s | After Svelte/TS edits — types only. |
+| `cargo check -p meetior` | a few s | After Rust edits — borrow checker only, no codegen. |
+| `cargo test -p meetior <pat>` | seconds | After backend logic edits — focused unit tests. |
+| `pnpm dev` (Vite only) | hot reload | UI-only iteration with the Tauri shell **closed**; mock `invoke` (see below). |
+| `pnpm tauri dev` | 30–60 s cold, hot after | End-to-end: clicking through the app on real macOS. |
+| `pnpm tauri build` | minutes | Pre-release sanity. Don't run in normal dev. |
+
+Run all three quick checks in parallel before pushing:
+
+```sh
+pnpm check & (cd src-tauri && cargo check) & (cd src-tauri && cargo test) & wait
+```
+
+### UI-only iteration (no Tauri shell)
+
+When iterating on Svelte, run Vite alone and stub the backend in
+`src/lib/api.ts` behind a `import.meta.env.DEV && !window.__TAURI_INTERNALS__`
+guard so the UI renders with fake data. Faster than rebuilding Rust. Don't
+commit the stubs — guard them or keep them in a local dev branch.
+
+### Unit testing the backend
+
+Each domain module should grow tests next to it. Pattern:
+
+```rust
+// in src-tauri/src/storage.rs
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> Store { Store::open(":memory:").unwrap() }
+
+    #[test]
+    fn round_trips_a_meeting() {
+        let s = store();
+        let m = crate::meeting::Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+        assert_eq!(s.list_meetings().unwrap().len(), 1);
+    }
+}
+```
+
+Conventions:
+- `storage.rs` tests use `:memory:` SQLite — no temp files, no cleanup.
+- `summarizer.rs` tests hit a fake Ollama via `wiremock` (add to dev-deps
+  when needed) or skip when `MEETIOR_OLLAMA_HOST` is unset.
+- `audio.rs` / `asr.rs` tests use **fixture WAVs** under
+  `src-tauri/tests/fixtures/`. Keep them short (≤ 5 s) and check expected
+  text loosely — exact ASR output is brittle. Word-error-rate against a
+  reference is fine.
+- Integration tests covering Tauri commands go in `src-tauri/tests/`. Use
+  `tauri::test::mock_app()` rather than spinning a real window.
+
+### Iterating on the stubs without macOS audio
+
+You don't need ScreenCaptureKit working to make progress on the rest of
+the pipeline. Two switches keep the dev loop tight:
+
+1. **Faux capture** — add an env-gated `audio::start_fixture_capture(path)`
+   that streams a WAV through the same `AudioChunk` channel. Wire it from
+   `commands::start_meeting` when `MEETIOR_FIXTURE_AUDIO=path/to.wav` is set.
+2. **Faux ASR** — likewise for `asr.rs`: when `MEETIOR_FIXTURE_TRANSCRIPT=path`
+   is set, replay a JSON file of `TranscriptSegment`s on a timer. Lets the
+   summarizer + UI evolve before Parakeet is wired.
+
+Don't let these grow features. They exist so M2 work doesn't block M3 work.
+
+### Logging & inspection
+
+```sh
+# Verbose backend logs (filterable per-module)
+RUST_LOG=meetior_lib=debug,ort=info pnpm tauri dev
+
+# Inspect the live database
+sqlite3 "$HOME/Library/Application Support/app.meetior/meetior/meetior.sqlite" \
+  ".tables" "SELECT id, title, status FROM meetings;"
+
+# Watch events in the UI
+# Open the Tauri devtools (Cmd+Option+I) → Console → events appear via api.ts.
+```
+
+For audio-pipeline debugging, write captured chunks to `/tmp/meetior-debug.wav`
+behind a `MEETIOR_DUMP_AUDIO=1` env. Inspect with QuickLook or `ffplay`.
+
+### Manual smoke test (run before pushing UI/backend changes)
+
+1. `pnpm tauri dev` — app opens, no console errors.
+2. Click **Start meeting** — status flips, active view shows "Listening…".
+   With a fixture WAV configured, segments appear within ~1 s.
+3. Click **Stop meeting** — returns to list, meeting shows `done`.
+4. Open the meeting → click **Generate summary & todos** with Ollama running
+   → summary + todos render; checkbox toggles persist after reload.
+5. Quit and reopen — meetings persist (SQLite survived).
+
+If any step fails, fix it before adding new behavior. Don't paper over a
+broken flow with a UI guard.
+
+### Performance budget
+
+We chose Rust + Tauri because we care about overhead. Rough targets:
+
+- Idle CPU with a meeting recording: < 15 % on M-series, single core.
+- Transcription latency (audio in → segment in UI): < 2 s p95.
+- Cold app start: < 1 s to first paint.
+
+Profile with Instruments (Time Profiler) and `cargo flamegraph`. Avoid
+allocating per audio chunk — reuse buffers in the audio + ASR loops.
+
+---
+
 ## Tauri command surface
 
 All commands live in `src-tauri/src/commands.rs`. Keep them thin — validate
