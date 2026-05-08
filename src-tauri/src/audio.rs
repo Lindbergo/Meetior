@@ -15,10 +15,12 @@ use tokio::sync::mpsc;
 use crate::{Error, Result};
 
 /// Sample format used by the rest of the pipeline (Parakeet expects 16 kHz mono f32).
+#[allow(dead_code)]
 pub const SAMPLE_RATE: u32 = 16_000;
 
 /// A chunk of audio samples in our canonical format (16 kHz mono f32, [-1.0, 1.0]).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct AudioChunk {
     /// Monotonic offset in ms from session start.
     pub offset_ms: u64,

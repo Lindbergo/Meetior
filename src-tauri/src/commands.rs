@@ -33,12 +33,23 @@ pub async fn start_meeting(
     state.store.insert_meeting(&meeting)?;
 
     // Capture → ASR → store + emit.
+    //
+    // If `MEETIOR_FIXTURE_TRANSCRIPT` is set we bypass audio + ASR and replay a
+    // canned transcript instead. This is the fast path for UI / summarizer
+    // iteration on machines without ScreenCaptureKit or a Parakeet model.
     let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
-    let audio_rx = audio::start_capture(stop_rx)
-        .map_err(|e| Error::Audio(e.to_string()))?;
-
-    let asr = Asr::new(AsrConfig::default()).map_err(|e| Error::Asr(e.to_string()))?;
-    let mut transcript_rx = asr.spawn_streaming(audio_rx);
+    let mut transcript_rx = if let Some(path) = crate::asr::fixture_transcript_path() {
+        tracing::info!(?path, "using fixture transcript stream");
+        // Drop stop_rx into a no-op task so the channel stays alive until stop.
+        let mut stop_rx = stop_rx;
+        tokio::spawn(async move { let _ = stop_rx.recv().await; });
+        crate::asr::spawn_fixture_stream(&path).map_err(|e| Error::Asr(e.to_string()))?
+    } else {
+        let audio_rx =
+            audio::start_capture(stop_rx).map_err(|e| Error::Audio(e.to_string()))?;
+        let asr = Asr::new(AsrConfig::default()).map_err(|e| Error::Asr(e.to_string()))?;
+        asr.spawn_streaming(audio_rx)
+    };
 
     let store = state.store.clone();
     let meeting_id = meeting.id.clone();

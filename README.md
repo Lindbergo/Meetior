@@ -16,6 +16,10 @@ ollama pull llama3.1:8b-instruct-q4_K_M
 pnpm install
 
 export ORT_DYLIB_PATH=$(brew --prefix onnxruntime)/lib/libonnxruntime.dylib
+export ORT_SKIP_DOWNLOAD=1
+
+# Try the full UI flow without real audio/ASR yet:
+export MEETIOR_FIXTURE_TRANSCRIPT="$PWD/examples/fixture-transcript.json"
 pnpm tauri dev
 ```
 

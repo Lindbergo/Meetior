@@ -22,6 +22,7 @@ use crate::meeting::TranscriptSegment;
 use crate::{Error, Result};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct AsrConfig {
     /// Directory containing `encoder.onnx`, `decoder_joint.onnx`, `tokenizer.json`.
     pub model_dir: PathBuf,
@@ -46,6 +47,7 @@ fn default_model_dir() -> PathBuf {
 
 /// Handle to a loaded ASR engine. Cheaply cloneable.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct Asr {
     inner: Arc<AsrInner>,
 }
@@ -96,4 +98,48 @@ impl Asr {
 #[allow(dead_code)]
 pub async fn transcribe_offline(_path: &Path, _cfg: &AsrConfig) -> Result<Vec<TranscriptSegment>> {
     Err(Error::Asr("offline transcription not implemented".into()))
+}
+
+// -----------------------------------------------------------------------------
+// Faux ASR — env-gated transcript replay.
+//
+// Set `MEETIOR_FIXTURE_TRANSCRIPT=/path/to/segments.json` to bypass real audio
+// + ASR and stream a canned transcript through the same channel. This unblocks
+// UI / summarizer / storage iteration before Parakeet is wired (see CLAUDE.md
+// → Build, test, iterate → Iterating on the stubs).
+// -----------------------------------------------------------------------------
+
+/// Spawn a faux transcript stream from a JSON file of `TranscriptSegment`s.
+///
+/// Segments are emitted on a timer aligned to their `start_ms` so the UI feels
+/// like a real meeting. Ends after the last segment, or when the consumer
+/// drops the receiver.
+pub fn spawn_fixture_stream(path: &Path) -> Result<mpsc::Receiver<TranscriptSegment>> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| Error::Asr(format!("read fixture {}: {e}", path.display())))?;
+    let segments: Vec<TranscriptSegment> = serde_json::from_str(&raw)
+        .map_err(|e| Error::Asr(format!("parse fixture {}: {e}", path.display())))?;
+
+    let (tx, rx) = mpsc::channel::<TranscriptSegment>(64);
+
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        for seg in segments {
+            let target = std::time::Duration::from_millis(seg.start_ms);
+            let elapsed = started.elapsed();
+            if target > elapsed {
+                tokio::time::sleep(target - elapsed).await;
+            }
+            if tx.send(seg).await.is_err() {
+                break; // consumer gone
+            }
+        }
+    });
+
+    Ok(rx)
+}
+
+/// Returns the configured fixture transcript path, if `MEETIOR_FIXTURE_TRANSCRIPT` is set.
+pub fn fixture_transcript_path() -> Option<PathBuf> {
+    std::env::var_os("MEETIOR_FIXTURE_TRANSCRIPT").map(PathBuf::from)
 }

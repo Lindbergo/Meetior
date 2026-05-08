@@ -301,3 +301,95 @@ fn parse_status(s: &str) -> MeetingStatus {
         _ => MeetingStatus::Idle,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meeting::Meeting;
+
+    fn store() -> Store {
+        // Per-test temp file — simpler than juggling SQLite URI memory mode
+        // through r2d2. Cleaned up automatically when the test process exits.
+        let path = std::env::temp_dir()
+            .join(format!("meetior_test_{}.sqlite", uuid::Uuid::new_v4()));
+        Store::open(path).unwrap()
+    }
+
+    #[test]
+    fn round_trips_a_meeting() {
+        let s = store();
+        let m = Meeting::new("standup");
+        s.insert_meeting(&m).unwrap();
+        let listed = s.list_meetings().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "standup");
+        assert_eq!(listed[0].status, MeetingStatus::Recording);
+    }
+
+    #[test]
+    fn appends_segments_in_order() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+        for (i, text) in ["hello", "world", "again"].iter().enumerate() {
+            s.append_segment(
+                &m.id,
+                &TranscriptSegment {
+                    start_ms: (i * 1000) as u64,
+                    end_ms: (i * 1000 + 800) as u64,
+                    speaker: Some("Alice".into()),
+                    text: (*text).into(),
+                },
+            )
+            .unwrap();
+        }
+        let detail = s.get_meeting_detail(&m.id).unwrap();
+        let texts: Vec<_> = detail.segments.iter().map(|x| x.text.clone()).collect();
+        assert_eq!(texts, vec!["hello", "world", "again"]);
+    }
+
+    #[test]
+    fn save_summary_replaces_todos() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+
+        let todo_a = Todo { id: "a".into(), text: "first".into(), done: false };
+        s.save_summary(&m.id, "first run", &[todo_a]).unwrap();
+
+        let todo_b = Todo { id: "b".into(), text: "second".into(), done: false };
+        s.save_summary(&m.id, "second run", &[todo_b]).unwrap();
+
+        let detail = s.get_meeting_detail(&m.id).unwrap();
+        assert_eq!(detail.summary.as_deref(), Some("second run"));
+        assert_eq!(detail.todos.len(), 1);
+        assert_eq!(detail.todos[0].id, "b");
+    }
+
+    #[test]
+    fn toggle_todo_flips_done() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+        let todo = Todo { id: "t1".into(), text: "do it".into(), done: false };
+        s.save_summary(&m.id, "x", &[todo]).unwrap();
+
+        let after = s.toggle_todo(&m.id, "t1").unwrap();
+        assert!(after.done);
+        let again = s.toggle_todo(&m.id, "t1").unwrap();
+        assert!(!again.done);
+    }
+
+    #[test]
+    fn update_status_sets_ended_at() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+        let ended = chrono::Utc::now();
+        let updated = s
+            .update_meeting_status(&m.id, MeetingStatus::Done, Some(ended))
+            .unwrap();
+        assert_eq!(updated.status, MeetingStatus::Done);
+        assert!(updated.ended_at.is_some());
+    }
+}

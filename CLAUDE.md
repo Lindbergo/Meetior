@@ -122,13 +122,28 @@ Run dev:
 pnpm tauri dev
 ```
 
-`ort` uses `load-dynamic` — point it at Homebrew's onnxruntime:
+`ort` uses `load-dynamic` — point it at Homebrew's onnxruntime, and skip
+ort's auto-download at build time:
 
 ```sh
 export ORT_DYLIB_PATH=$(brew --prefix onnxruntime)/lib/libonnxruntime.dylib
+export ORT_SKIP_DOWNLOAD=1
 ```
 
-Add this to your shell profile or a `.envrc` (direnv).
+Add both to your shell profile or a `.envrc` (direnv).
+
+### First end-to-end demo (no Parakeet, no audio yet)
+
+```sh
+ollama serve &  # if not already running
+export MEETIOR_FIXTURE_TRANSCRIPT="$PWD/examples/fixture-transcript.json"
+pnpm tauri dev
+```
+
+Click **Start meeting** → fixture transcript streams in → **Stop** → open
+the meeting → **Generate summary & todos** → Ollama produces a real
+summary + todos from the canned text. Validates the entire pipeline shape
+without any of the M2 work.
 
 ---
 
@@ -210,16 +225,26 @@ Conventions:
 ### Iterating on the stubs without macOS audio
 
 You don't need ScreenCaptureKit working to make progress on the rest of
-the pipeline. Two switches keep the dev loop tight:
+the pipeline.
 
-1. **Faux capture** — add an env-gated `audio::start_fixture_capture(path)`
-   that streams a WAV through the same `AudioChunk` channel. Wire it from
-   `commands::start_meeting` when `MEETIOR_FIXTURE_AUDIO=path/to.wav` is set.
-2. **Faux ASR** — likewise for `asr.rs`: when `MEETIOR_FIXTURE_TRANSCRIPT=path`
-   is set, replay a JSON file of `TranscriptSegment`s on a timer. Lets the
-   summarizer + UI evolve before Parakeet is wired.
+**Faux ASR — already implemented.** Set `MEETIOR_FIXTURE_TRANSCRIPT` to a
+JSON file of `TranscriptSegment`s and `commands::start_meeting` will replay
+it on a timer instead of starting real audio capture. A sample is shipped
+at `examples/fixture-transcript.json`:
 
-Don't let these grow features. They exist so M2 work doesn't block M3 work.
+```sh
+export MEETIOR_FIXTURE_TRANSCRIPT="$PWD/examples/fixture-transcript.json"
+pnpm tauri dev
+```
+
+Click **Start meeting** → segments stream into the active view at their
+real timestamps → click **Stop** → open the meeting → **Generate summary &
+todos** hits Ollama. Full flow without Parakeet or ScreenCaptureKit.
+
+**Faux audio capture** is *not yet implemented*. When we need it (e.g. to
+test the mel-spec pipeline against a known WAV), add `MEETIOR_FIXTURE_AUDIO`
+in `audio.rs` symmetrically. Don't let either grow features — they exist so
+M2 work doesn't block M3 work.
 
 ### Logging & inspection
 
@@ -343,12 +368,13 @@ real, transcript segments will start flowing into the UI without changes here.
 
 ## Roadmap
 
-### M1 — Foundation (this commit)
+### M1 — Foundation (done)
 - [x] Tauri 2 + Svelte scaffold compiles end-to-end.
 - [x] Manual start/stop UI.
-- [x] SQLite persistence.
+- [x] SQLite persistence (with unit tests).
 - [x] Ollama summarization wired in.
 - [x] Audio + ASR module stubs with clear contracts.
+- [x] Faux ASR fixture pipeline so the full UI flow runs without Parakeet.
 
 ### M2 — Real transcription (manual start)
 - [ ] mic capture via `cpal` → 16 kHz f32 chunks.
