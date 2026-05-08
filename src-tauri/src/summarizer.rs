@@ -28,16 +28,25 @@ pub struct OllamaClient {
     model: String,
 }
 
-impl Default for OllamaClient {
-    fn default() -> Self {
+impl OllamaClient {
+    pub fn new(host: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()
                 .expect("reqwest client"),
-            host: env::var("MEETIOR_OLLAMA_HOST").unwrap_or_else(|_| DEFAULT_HOST.into()),
-            model: env::var("MEETIOR_OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
+            host: host.into(),
+            model: model.into(),
         }
+    }
+}
+
+impl Default for OllamaClient {
+    fn default() -> Self {
+        Self::new(
+            env::var("MEETIOR_OLLAMA_HOST").unwrap_or_else(|_| DEFAULT_HOST.into()),
+            env::var("MEETIOR_OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
+        )
     }
 }
 
@@ -79,6 +88,7 @@ struct SummaryPayload {
     todos: Vec<String>,
 }
 
+#[derive(Debug)]
 pub struct Summary {
     pub summary: String,
     pub todos: Vec<Todo>,
@@ -136,5 +146,127 @@ impl OllamaClient {
             .collect();
 
         Ok(Summary { summary: payload.summary, todos })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn segment(text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            start_ms: 0,
+            end_ms: 1000,
+            speaker: Some("Alice".into()),
+            text: text.into(),
+        }
+    }
+
+    fn ollama_chat_response(content: &str) -> serde_json::Value {
+        // Real Ollama responses have many more fields; we only need `message.content`.
+        json!({ "message": { "role": "assistant", "content": content } })
+    }
+
+    #[tokio::test]
+    async fn happy_path_parses_summary_and_todos() {
+        let server = MockServer::start().await;
+        let model_json = json!({
+            "summary": "Quick standup. Alice will own copy. Bob is blocked on Stripe keys.",
+            "todos": ["Send Stripe keys to Bob", "Draft webhook spec by EOD tomorrow"],
+        })
+        .to_string();
+
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_response(&model_json)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(server.uri(), "test-model");
+        let result = client.summarize(&[segment("hello there")]).await.unwrap();
+
+        assert!(result.summary.starts_with("Quick standup"));
+        assert_eq!(result.todos.len(), 2);
+        assert_eq!(result.todos[0].text, "Send Stripe keys to Bob");
+        assert!(!result.todos[0].done);
+        // IDs are generated server-side and unique per todo.
+        assert_ne!(result.todos[0].id, result.todos[1].id);
+    }
+
+    #[tokio::test]
+    async fn missing_todos_field_yields_empty_list() {
+        let server = MockServer::start().await;
+        let model_json = json!({ "summary": "no actionable items" }).to_string();
+
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_response(&model_json)))
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(server.uri(), "test-model");
+        let result = client.summarize(&[segment("...")]).await.unwrap();
+
+        assert_eq!(result.summary, "no actionable items");
+        assert!(result.todos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_inner_json_is_a_summarizer_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(ollama_chat_response("not json at all { ")),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(server.uri(), "test-model");
+        let err = client.summarize(&[segment("...")]).await.unwrap_err();
+        assert!(matches!(err, Error::Summarizer(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn http_5xx_is_an_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(server.uri(), "test-model");
+        let err = client.summarize(&[segment("...")]).await.unwrap_err();
+        assert!(matches!(err, Error::Http(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn request_uses_configured_model_and_json_format() {
+        use wiremock::matchers::body_partial_json;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_partial_json(json!({
+                "model": "my-custom-model",
+                "format": "json",
+                "stream": false,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ollama_chat_response(
+                &json!({ "summary": "ok", "todos": [] }).to_string(),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(server.uri(), "my-custom-model");
+        client.summarize(&[segment("hi")]).await.unwrap();
+        // Mock's `expect(1)` is verified on drop — server panics if not hit.
     }
 }
