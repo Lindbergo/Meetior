@@ -70,15 +70,19 @@ The only network call is to a local Ollama server on `127.0.0.1:11434`.
 ├── svelte.config.js
 ├── tsconfig.json
 ├── index.html
+├── HANDOFF.md                 # Living checklist of unverified / deferred work
 ├── src/                       # Svelte frontend
 │   ├── main.ts
 │   ├── app.css
-│   ├── App.svelte             # Top-level: list / active / detail
+│   ├── App.svelte             # Sidebar + main pane; list / active / detail
 │   └── lib/
 │       ├── api.ts             # Typed wrapper over invoke + events
+│       ├── Sidebar.svelte     # Filters + clients with color palette
+│       ├── StartDialog.svelte # Title + client picker modal
 │       ├── MeetingList.svelte
 │       ├── ActiveMeeting.svelte
-│       └── MeetingDetail.svelte
+│       ├── MeetingDetail.svelte
+│       └── SearchResults.svelte # Notes search hits
 └── src-tauri/                 # Rust backend
     ├── Cargo.toml
     ├── tauri.conf.json
@@ -136,6 +140,12 @@ export ORT_SKIP_DOWNLOAD=1
 
 Add both to your shell profile or a `.envrc` (direnv).
 
+**On Linux / CI / agent sandboxes** (no onnxruntime installed) export
+just `ORT_SKIP_DOWNLOAD=1`. `cargo check` and `cargo test --lib` compile
+fine without the dylib because they exercise the domain modules and
+never call `ort::init()`. Skip `ORT_DYLIB_PATH` — it'd just point at a
+file that isn't there.
+
 ### First end-to-end demo (no Parakeet, no audio yet)
 
 ```sh
@@ -185,6 +195,11 @@ Run all three quick checks in parallel before pushing:
 ```sh
 pnpm check & (cd src-tauri && cargo check) & (cd src-tauri && cargo test) & wait
 ```
+
+**For UI changes also run `pnpm build`.** Vite's prod build is stricter
+than `pnpm check`: it fails on unused imports, dead component branches,
+and a handful of correctness issues svelte-check waves through. Cheap
+(~1 s) and worth the round-trip.
 
 ### UI-only iteration (no Tauri shell)
 
@@ -269,13 +284,26 @@ behind a `MEETIOR_DUMP_AUDIO=1` env. Inspect with QuickLook or `ffplay`.
 
 ### Manual smoke test (run before pushing UI/backend changes)
 
-1. `pnpm tauri dev` — app opens, no console errors.
-2. Click **Start meeting** — status flips, active view shows "Listening…".
-   With a fixture WAV configured, segments appear within ~1 s.
-3. Click **Stop meeting** — returns to list, meeting shows `done`.
-4. Open the meeting → click **Generate summary & todos** with Ollama running
-   → summary + todos render; checkbox toggles persist after reload.
-5. Quit and reopen — meetings persist (SQLite survived).
+1. `pnpm tauri dev` — app opens, no console errors. Sidebar shows "All
+   meetings (0)" and "Unassigned (0)".
+2. Sidebar → **+** under Clients → type "Acme" → Enter. New client
+   appears with the first palette color and becomes the active filter.
+3. Click **Start meeting** → dialog opens. Title pre-fills with the
+   default; client picker is pre-filled with the active filter (Acme).
+   Press Esc to confirm it closes; reopen and click **Start**.
+4. Active view: 60/40 split with transcript on the left, notes pane on
+   the right. With `MEETIOR_FIXTURE_TRANSCRIPT` set, segments appear
+   within ~1 s. Type a note and press Enter — it appears with `m:ss`.
+5. **Stop meeting** → returns to list. Row shows the Acme tag with the
+   color dot.
+6. Open the meeting → **Generate summary & todos** with Ollama running →
+   summary + todos render. Click a todo's text to edit; **+** adds a
+   new todo; **×** deletes one. Checkbox state and edits persist after
+   reopening the meeting.
+7. Header search → type a substring of one of your notes → results
+   replace the list and the match is highlighted. Click a hit, land on
+   the meeting, click **Back**, search query is preserved.
+8. Quit and reopen — meetings, clients, notes, edits all persist.
 
 If any step fails, fix it before adding new behavior. Don't paper over a
 broken flow with a UI guard.
@@ -311,6 +339,24 @@ Events emitted to the UI:
 
 - `meetior://transcript-segment` — `{ meeting_id, start_ms, end_ms, speaker, text }`
 - `meetior://meeting-status` — `Meeting`
+
+Notes for adding commands:
+
+- **Naming.** Tauri auto-translates Rust `snake_case` args to JS
+  `camelCase`. So `pub async fn foo(meeting_id: String)` is invoked from
+  TS as `invoke("foo", { meetingId })`. The TS wrappers in `api.ts`
+  follow this convention; mirror it on new commands so the existing
+  `commands::*` macros line up.
+- **Don't unit-test the command** — they're intentionally thin. Test
+  the storage method (or whichever domain function the command
+  delegates to). For end-to-end coverage use `tauri::test::mock_app()`
+  in `src-tauri/tests/`.
+- **Emit `meetior://meeting-status`** after any mutation that changes
+  a field shown in the meetings list (title, client, status,
+  ended_at). The frontend already listens to it and re-fetches; this
+  keeps the list and sidebar counts consistent without callback
+  threading. Pure-child mutations (notes, todos, summary) don't need
+  to emit; they're only visible when a single meeting is open.
 
 ---
 
@@ -357,16 +403,22 @@ that constrains output to `{ summary, todos }`. Override host/model via
 `MEETIOR_OLLAMA_HOST` / `MEETIOR_OLLAMA_MODEL`.
 
 ### `storage.rs` — working
-SQLite schema in `migrate()`. `meetings`, `segments`, `summaries`, `todos`.
-WAL mode, FK on. All write paths are synchronous against the `r2d2` pool.
+SQLite schema in `migrate()`. Tables: `meetings`, `clients`, `segments`,
+`notes`, `summaries`, `todos`. WAL mode, FK on. All write paths are
+synchronous against the `r2d2` pool. Migration model is **additive only**
+via `ensure_column()` — destructive changes (rename / drop / type
+changes) will need a real migration runner; flag it on PR.
 
 ### `meeting.rs` — working
 Domain types + `Session` (the in-flight pipeline handle). `Session::shutdown`
 sends a stop signal and awaits all spawned tasks.
 
 ### `commands.rs` — working (against stubs)
-The full pipeline wiring already exists; once `audio.rs` and `asr.rs` are
-real, transcript segments will start flowing into the UI without changes here.
+Pipeline wiring (start/stop/list/get/summarize/toggle_todo) is in.
+M2b grew it with client CRUD, meeting edits (title, client),
+note + summary + todo editing, and `search_notes`. Once `audio.rs` and
+`asr.rs` are real, transcript segments start flowing into the UI without
+changes in this file.
 
 ---
 
@@ -394,19 +446,28 @@ Driven by [`PRODUCT.md`](./PRODUCT.md). Suggested order:
 - [ ] `scripts/export-parakeet.py` for the model export step.
 
 **M2b — Product surface around it**
-- [ ] `clients` table + Tauri commands (`create_client`, `list_clients`).
-      Sidebar UI with curated color palette.
-- [ ] Client picker in the Start dialog (existing / new / no client).
-- [ ] `notes` table + live notes pane in active-meeting view, with
-      timestamp + speaker-hint derived from recent dominant source.
+- [x] `clients` table + Tauri commands (`create_client`, `list_clients`,
+      `update_client`, `delete_client`). Sidebar UI with curated 9-color
+      palette + auto-assign next-unused.
+- [x] Client picker in the Start dialog (existing / new / no client).
+- [x] `notes` table + live notes pane in active-meeting view with `m:ss`
+      timestamps. Speaker-hint plumbing exists end-to-end but defaults
+      to `unknown` until M2a wires real audio-source data into it.
 - [ ] `importer.rs` (symphonia) + `import_meeting` command + UI button.
       Reject `.mp4`/`.mov` up front for v1.
-- [ ] Edit affordances: meeting title, client, summary text, todos
+- [x] Edit affordances: meeting title, client, summary text, todos
       (add / delete / edit text). Transcript stays read-only.
-- [ ] Filter UI: client + date range chips. SQLite indexes only.
+- [~] Filter UI: client filter shipped. Date range chips still pending.
 - [ ] Cross-client digest view + `digest()` method on `summarizer.rs`.
 - [ ] Crash-recovery on launch: any meeting in `recording` status → mark
       `done`, keep saved segments and notes.
+- [ ] Client rename / delete affordances in the sidebar (backend ready).
+
+**M2c — Notes search (LIKE-based, foundation for M3 FTS)**
+- [x] `search_notes(query, client_id?)` — SQLite `LIKE ? ESCAPE '\'`,
+      joined with meeting metadata, capped at 200 hits.
+- [x] Header search box, debounced 200 ms, scoped by active client
+      filter, match-highlighted result cards.
 
 ### M3 — Auto-detect & polish
 - [ ] VAD-based "meeting started?" prompt.
@@ -416,7 +477,8 @@ Driven by [`PRODUCT.md`](./PRODUCT.md). Suggested order:
       mic/system heuristic where it's confident.
 - [ ] Settings UI: retention policy, model picker, audio source toggles,
       hotkey.
-- [ ] Full-text search across transcripts (SQLite FTS5).
+- [ ] Full-text search across transcripts + notes (SQLite FTS5,
+      replaces the M2c LIKE-based notes search).
 
 ### M4 — Distribution
 - [ ] Replace placeholder icons (`pnpm tauri icon source.png`).
@@ -436,6 +498,23 @@ Driven by [`PRODUCT.md`](./PRODUCT.md). Suggested order:
 - **UI**: keep it deliberately simple while we iterate on the backend.
   Three views only: list, active, detail. Don't add navigation, settings,
   or theming beyond the existing CSS variables yet.
+- **HANDOFF.md**: when you can't verify something visually (no display,
+  can't run the Tauri shell, no Ollama in the sandbox), append a
+  checklist line so the next person picks it up. Living scratch file —
+  prune as items land. Don't treat it as durable spec; PRODUCT.md / this
+  file are the durable docs.
+- **Svelte 5 gotchas** (each one ate a build cycle):
+  - `onMount` callbacks must return a sync cleanup or nothing — never a
+    `Promise<() => void>`. For async setup, fire-and-forget the promise
+    and return a sync cleanup that closes over the captured handle (see
+    `ActiveMeeting.svelte` for the pattern).
+  - When a `$state` initializer reads a `$props()` value that you only
+    want at mount time, wrap it in `untrack(() => ...)` to silence the
+    "this reference only captures the initial value" warning and make
+    the intent explicit (see `StartDialog.svelte`).
+  - svelte-check flags `<form role="dialog">` and click-only handlers on
+    non-interactive elements; lift `role="dialog"` onto a div wrapper
+    and use a real button for click-to-close on backdrops.
 
 ---
 
