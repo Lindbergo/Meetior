@@ -3,6 +3,31 @@
 Things I couldn't do from the agent's Linux dev environment, or
 deliberately deferred — running list, prune as you check items off.
 
+## Picking this up?
+
+If you're starting a fresh Claude session (or coming back from mobile),
+read these in order — together they take ~3 minutes:
+
+1. **[`CLAUDE.md`](./CLAUDE.md)** — durable brief: stack, repo layout,
+   build/test loop, conventions. The one section worth re-reading
+   every time is "Build, test, iterate" → "Dev loops, ranked by cost".
+2. **[`PRODUCT.md`](./PRODUCT.md)** — the *what* (data model, user
+   journeys, behavior boundaries).
+3. **This file** — what's pending and where the gaps are.
+4. **[`M2A-PLAN.md`](./M2A-PLAN.md)** — the next big chunk of work
+   (real ASR via Parakeet). Step-by-step, each step ships on its own.
+
+Current branch state (last touched): `claude/meeting-transcription-app-fFtqw`.
+M2b (clients, notes, edits) and M2c (notes search) are merged. Manual
+macOS verification is the biggest open item before M2a starts — see
+the checklist below. Everything ships green on `pnpm check`,
+`cargo clippy`, and 36 unit tests.
+
+To resume: tell the agent **"continue M2a step N"** (replace N) and
+the plan doc is detailed enough that a cold session can execute it.
+
+---
+
 ## Manual verification on macOS
 
 I never opened the Tauri shell. Please `pnpm tauri dev` and walk through:

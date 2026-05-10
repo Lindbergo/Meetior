@@ -435,7 +435,7 @@ changes in this file.
 ### M2 — Real transcription + product surface
 Driven by [`PRODUCT.md`](./PRODUCT.md). Suggested order:
 
-**M2a — Real ASR (foundation)**
+**M2a — Real ASR (foundation)** — step-by-step plan in [`M2A-PLAN.md`](./M2A-PLAN.md).
 - [ ] mic capture via `cpal` → 16 kHz f32 chunks. Tag chunks with
       `speaker_source = mic`.
 - [ ] system-audio capture via `screencapturekit` (macOS 13+). Tag chunks
