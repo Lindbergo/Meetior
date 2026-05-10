@@ -263,15 +263,41 @@ These adjust the technical layout in `CLAUDE.md`:
 
 ---
 
+## Decisions
+
+These were open questions resolved during planning. Record changes here
+with a date if any decision is reopened.
+
+### Parakeet model hosting
+GitHub release attachment on this repo, tagged
+`parakeet-tdt-0.6b-v3-onnx`. ~600 MB — comfortably under the 2 GB/file
+limit, CDN-backed, anonymous public download, no extra infra or
+third-party platform in the privacy story. SHA-256 of each artifact is
+committed in code; first-run downloads to app-data and verifies before
+loading. Bootstrap is a one-time export on a Linux/GPU box via
+`scripts/export-parakeet.py`, then upload + tag.
+
+### Client color palette
+Curated 9 swatches: red, orange, amber, green, teal, blue, indigo,
+purple, gray. New clients get the next unused color auto-assigned; the
+user can change it from a swatch row in the client editor. No free hex
+picker — non-designers produce clashing palettes and the picker adds
+friction to a frequent action. Same pattern as Linear / Things.
+
+### Video file import (v1)
+Rejected up front. The Import file picker filters to audio extensions
+(`.wav` / `.mp3` / `.m4a` / `.flac`); drag-and-drop of `.mp4` / `.mov` /
+`.webm` shows a friendly error: "Video files aren't supported yet.
+Convert to `.m4a` first, or wait for v1.1." Accepting then failing at
+symphonia decode produces an opaque error and worse UX.
+
+**Planned for v1.1:** ffmpeg-based audio extraction so video files just
+work. Single dependency, no new architecture.
+
+---
+
 ## Open questions (decide before they block work)
 
-- **Parakeet model URL + checksum.** Where do we host the ONNX artifacts?
-  GitHub release attachment is the path of least resistance; ~600 MB.
-- **Color palette for clients.** Curated 8 colors vs free hex picker.
-  Lean curated for v1 — fewer choices, prettier defaults.
 - **Digest prompt.** What's the actual system prompt for "rolling status
-  per client"? Worth iterating on with real meeting data, not designing
-  upfront.
-- **Imported file with embedded video.** Reject `.mp4`/`.mov` with a clear
-  error in v1 (defer to ffmpeg in v1.x), or accept and fail at decode time?
-  Lean toward up-front rejection for honesty.
+  per client"? Best iterated on with real meeting data — not worth
+  designing in the abstract. Park until M2b gets to the digest view.
