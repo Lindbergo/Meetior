@@ -117,7 +117,11 @@
       {#if active}
         <ActiveMeeting meeting={active} />
       {:else if viewing}
-        <MeetingDetail id={viewing} onBack={() => (viewing = null)} />
+        <MeetingDetail
+          id={viewing}
+          {clients}
+          onBack={() => (viewing = null)}
+        />
       {:else}
         <MeetingList
           meetings={visibleMeetings}
