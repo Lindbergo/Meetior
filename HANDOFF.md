@@ -76,6 +76,21 @@ I never opened the Tauri shell. Please `pnpm tauri dev` and walk through:
 - [ ] Try a query containing `%` and `_` — should match those literally
       (escaping is tested in storage; verify visually)
 
+**M2a step 1 (mic capture)**
+- [ ] On macOS, `pnpm tauri dev` → Start a meeting (no
+      `MEETIOR_FIXTURE_TRANSCRIPT` set, no `MEETIOR_FIXTURE_AUDIO` set).
+      First run prompts for microphone permission. Speak. Confirm
+      backend logs show `mic capture starting` with the device name +
+      sample rate. ASR is still a stub so no segments stream — but
+      `cargo test --lib audio` passes here, so the chunking + resample
+      math is verified
+- [ ] With `MEETIOR_FIXTURE_AUDIO=path/to/test.wav` set, Start →
+      backend logs show `MEETIOR_FIXTURE_AUDIO set — using fixture audio`
+      and chunks are emitted at real-time pace. Any 16-bit / float WAV
+      at any rate works (gets resampled + mixed to mono in software)
+- [ ] `Info.plist` `NSMicrophoneUsageDescription` text reads correctly
+      in the macOS prompt
+
 **End-to-end fixture flow**
 - [ ] `export MEETIOR_FIXTURE_TRANSCRIPT="$PWD/examples/fixture-transcript.json"`
       → start with a client → segments stream → take a few notes →

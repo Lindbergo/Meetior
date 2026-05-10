@@ -51,6 +51,9 @@ cpal = "0.15"
 # Resampling / DSP for ASR pre-processing
 rubato = "0.16"
 
+# WAV I/O for the fixture-audio path + unit tests. Tiny crate.
+hound = "3.5"
+
 # ASR — ONNX Runtime
 # Note: requires the ONNX Runtime dynamic library on the system at runtime.
 # See CLAUDE.md "Setup" for installation.

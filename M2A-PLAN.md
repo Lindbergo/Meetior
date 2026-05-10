@@ -35,11 +35,18 @@ can land without it because they don't touch ONNX runtime.
 
 ---
 
-## Step 1 — Mic capture (cpal → 16 kHz f32 chunks)
+## Step 1 — Mic capture (cpal → 16 kHz f32 chunks) — **shipped**
 
 **Done when**: `audio::start_capture` returns a real `mpsc::Receiver<AudioChunk>`
 that emits ~200 ms of 16 kHz mono f32 samples per chunk, tagged
-`source: SpeakerSource::Mic`.
+`source: SpeakerSource::Mic`. ✓
+
+Status: shipped in commit `8447afb` (or thereabouts). 11 unit tests
+cover the DSP path (mixdown, resample, chunking, WAV round-trip). The
+cpal mic-device wiring itself is **not** unit-tested — it needs a real
+input device + macOS permission grant. Walk it on macOS via
+`pnpm tauri dev` to verify; the surrounding pipeline (resampling,
+chunking, source tagging) is verified.
 
 **Files**: `src-tauri/src/audio.rs` (replace stub), `src-tauri/Cargo.toml`
 (add `cpal = "0.15"`, `rubato = "0.15"`).
