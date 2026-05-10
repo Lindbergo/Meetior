@@ -77,10 +77,30 @@ count / sample count are right within rounding.
 
 ---
 
-## Step 2 — Mel-spectrogram preprocessing (pure CPU)
+## Step 2 — Mel-spectrogram preprocessing (pure CPU) — **shipped**
 
 **Done when**: 16 kHz f32 chunks → 80-bin log-mel feature frames
-(25 ms window, 10 ms hop), matching Parakeet's training config.
+(25 ms window, 10 ms hop), matching Parakeet's training config. ✓
+
+Status: shipped at `src-tauri/src/asr/mel.rs`. NeMo-default config
+(n_fft=512, win=400, hop=160, 80 mel bins, Slaney mel scale, power
+spectrum, log(x + 2⁻²⁴)). Pre-emphasis is implemented but disabled by
+default (NeMo's α=0.97 is opt-in via `MelConfig::pre_emph`); we'll
+turn it on if step 3 WER measurements demand it. Per-utterance
+normalization isn't applied here — Parakeet's ONNX export usually
+includes its own normalization layer.
+
+13 unit tests cover: mel-scale invariants, filterbank shape +
+peak-at-1.0, frame-count math, log-floor on silence, sine-peaks-in-
+expected-bin, and **the streaming guarantee** —
+`streaming_matches_batch` and `streaming_handles_chunk_boundary_at_every_offset`
+prove that splitting a buffer at any offset and processing in two calls
+produces frames bit-identical to processing the whole buffer in one
+call (within 1e-4 float tolerance). Pre-emphasis streaming verified
+separately at α=0.97.
+
+Module reorg: `asr.rs` became `asr/mod.rs` so `asr/decoder.rs` and
+`asr/tokenizer.rs` (step 3) can land alongside `asr/mel.rs`.
 
 **Files**: new `src-tauri/src/asr/mel.rs` (or whatever submodule layout
 you pick — see *Module layout* below). `Cargo.toml`: add `realfft = "3.5"`.
