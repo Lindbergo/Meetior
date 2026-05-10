@@ -26,7 +26,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection};
 
 use crate::meeting::{
-    Client, ClientColor, Meeting, MeetingDetail, MeetingSource, MeetingStatus, Note,
+    Client, ClientColor, Meeting, MeetingDetail, MeetingSource, MeetingStatus, Note, NoteHit,
     SpeakerHint, SpeakerSource, Todo, TranscriptSegment,
 };
 use crate::{Error, Result};
@@ -406,6 +406,62 @@ impl Store {
             speaker_hint,
             text: text.to_string(),
         })
+    }
+
+    /// Substring search across all notes, optionally constrained to a
+    /// single client. Returns notes joined with the meeting metadata the
+    /// UI needs to render context (title, started_at, client_id).
+    ///
+    /// Uses `LIKE ? ESCAPE '\'` with `%` and `_` escaped in the user's
+    /// query — so typing "100%" matches the literal substring rather than
+    /// wildcarding everything. Match is case-insensitive for ASCII via
+    /// SQLite's default LIKE behavior.
+    ///
+    /// Empty / whitespace queries return an empty list rather than
+    /// dumping every note. Capped at 200 hits for safety.
+    pub fn search_notes(
+        &self,
+        query: &str,
+        client_id: Option<&str>,
+    ) -> Result<Vec<NoteHit>> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!(
+            "%{}%",
+            trimmed
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_"),
+        );
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT
+                 m.id, m.title, m.started_at, m.client_id,
+                 n.idx, n.t_ms, n.speaker_hint, n.text
+             FROM notes n
+             JOIN meetings m ON m.id = n.meeting_id
+             WHERE n.text LIKE ?1 ESCAPE '\\'
+               AND (?2 IS NULL OR m.client_id = ?2)
+             ORDER BY m.started_at DESC, n.idx ASC
+             LIMIT 200",
+        )?;
+        let hits = stmt
+            .query_map(params![pattern, client_id], |r| {
+                Ok(NoteHit {
+                    meeting_id: r.get(0)?,
+                    meeting_title: r.get(1)?,
+                    meeting_started_at: parse_ts(&r.get::<_, String>(2)?, 2)?,
+                    client_id: r.get(3)?,
+                    idx: r.get::<_, i64>(4)? as u32,
+                    t_ms: r.get::<_, i64>(5)? as u64,
+                    speaker_hint: parse_speaker_hint(&r.get::<_, String>(6)?),
+                    text: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(hits)
     }
 
     pub fn list_notes(&self, meeting_id: &str) -> Result<Vec<Note>> {
@@ -983,5 +1039,102 @@ mod tests {
         s.insert_meeting(&m).unwrap();
         let err = s.delete_todo(&m.id, "nope").unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+    }
+
+    // --- search_notes ---------------------------------------------------
+
+    #[test]
+    fn search_notes_empty_query_returns_empty() {
+        let s = store();
+        let m = Meeting::new("x");
+        s.insert_meeting(&m).unwrap();
+        s.append_note(&m.id, 0, SpeakerHint::You, "anything").unwrap();
+        assert_eq!(s.search_notes("", None).unwrap().len(), 0);
+        assert_eq!(s.search_notes("   ", None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn search_notes_matches_substring_case_insensitively() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+        s.append_note(&m.id, 1000, SpeakerHint::You, "Need to verify SLA target").unwrap();
+        s.append_note(&m.id, 2000, SpeakerHint::Them, "Slack channel request").unwrap();
+        s.append_note(&m.id, 3000, SpeakerHint::Unknown, "Other note").unwrap();
+
+        // "verify" appears only in the SLA note.
+        let hits = s.search_notes("verify", None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "Need to verify SLA target");
+        assert_eq!(hits[0].meeting_id, m.id);
+        assert_eq!(hits[0].meeting_title, "test");
+
+        // Uppercase query matches mixed-case content.
+        let upper = s.search_notes("CHANNEL", None).unwrap();
+        assert_eq!(upper.len(), 1);
+        assert!(upper[0].text.contains("channel"));
+
+        // "sla" is a substring of both "SLA" and "Slack" — so two hits is right.
+        let both = s.search_notes("sla", None).unwrap();
+        assert_eq!(both.len(), 2);
+    }
+
+    #[test]
+    fn search_notes_filters_by_client() {
+        let s = store();
+        let acme = s.create_client("Acme").unwrap();
+        let other = s.create_client("Other").unwrap();
+
+        let m1 = Meeting::new("a").with_client(Some(acme.id.clone()));
+        s.insert_meeting(&m1).unwrap();
+        s.append_note(&m1.id, 0, SpeakerHint::You, "shared phrase").unwrap();
+
+        let m2 = Meeting::new("b").with_client(Some(other.id.clone()));
+        s.insert_meeting(&m2).unwrap();
+        s.append_note(&m2.id, 0, SpeakerHint::You, "shared phrase").unwrap();
+
+        let acme_only = s.search_notes("shared", Some(&acme.id)).unwrap();
+        assert_eq!(acme_only.len(), 1);
+        assert_eq!(acme_only[0].meeting_id, m1.id);
+
+        let everyone = s.search_notes("shared", None).unwrap();
+        assert_eq!(everyone.len(), 2);
+    }
+
+    #[test]
+    fn search_notes_escapes_like_wildcards() {
+        let s = store();
+        let m = Meeting::new("x");
+        s.insert_meeting(&m).unwrap();
+        s.append_note(&m.id, 0, SpeakerHint::You, "foo bar").unwrap();
+        s.append_note(&m.id, 1, SpeakerHint::You, "100% sure").unwrap();
+        s.append_note(&m.id, 2, SpeakerHint::You, "weird_thing").unwrap();
+
+        // % must match literally, not act as a wildcard.
+        let pct = s.search_notes("100%", None).unwrap();
+        assert_eq!(pct.len(), 1);
+        assert!(pct[0].text.contains("100%"));
+
+        // A bare % should match nothing (no literal % in any note).
+        // Without escaping, this would match every note.
+        let bare = s.search_notes("%", None).unwrap();
+        assert_eq!(bare.len(), 1, "% must be literal; only 100% contains it");
+
+        // _ must match literally too.
+        let underscore = s.search_notes("_", None).unwrap();
+        assert_eq!(underscore.len(), 1);
+        assert!(underscore[0].text.contains("weird_thing"));
+    }
+
+    #[test]
+    fn search_notes_includes_unassigned_meetings_in_unfiltered_results() {
+        let s = store();
+        let m = Meeting::new("orphan");
+        s.insert_meeting(&m).unwrap();
+        s.append_note(&m.id, 0, SpeakerHint::You, "lonely note").unwrap();
+
+        let hits = s.search_notes("lonely", None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].client_id.is_none());
     }
 }

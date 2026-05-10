@@ -65,6 +65,17 @@ export interface Todo {
   done: boolean;
 }
 
+export interface NoteHit {
+  meeting_id: string;
+  meeting_title: string;
+  meeting_started_at: string;
+  client_id: string | null;
+  idx: number;
+  t_ms: number;
+  speaker_hint: SpeakerHint;
+  text: string;
+}
+
 export interface MeetingDetail extends Meeting {
   client: Client | null;
   segments: TranscriptSegment[];
@@ -96,6 +107,8 @@ export const api = {
   // notes
   appendNote: (meetingId: string, text: string, speakerHint?: SpeakerHint) =>
     invoke<Note>("append_note", { meetingId, text, speakerHint }),
+  searchNotes: (query: string, clientId: string | null) =>
+    invoke<NoteHit[]>("search_notes", { query, clientId }),
 
   // summary + todos
   updateSummary: (meetingId: string, summary: string) =>

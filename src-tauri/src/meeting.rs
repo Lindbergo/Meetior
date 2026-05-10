@@ -230,6 +230,20 @@ pub struct MeetingDetail {
     pub todos: Vec<Todo>,
 }
 
+/// A note returned by `search_notes`, denormalized with enough meeting
+/// metadata to render the result list without a second round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteHit {
+    pub meeting_id: String,
+    pub meeting_title: String,
+    pub meeting_started_at: DateTime<Utc>,
+    pub client_id: Option<String>,
+    pub idx: u32,
+    pub t_ms: u64,
+    pub speaker_hint: SpeakerHint,
+    pub text: String,
+}
+
 /// Active recording session. Held in `AppState` while a meeting is live.
 pub struct Session {
     pub meeting_id: String,

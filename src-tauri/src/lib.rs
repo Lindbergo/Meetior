@@ -68,6 +68,7 @@ pub fn run() {
             commands::update_meeting_title,
             commands::set_meeting_client,
             commands::append_note,
+            commands::search_notes,
             commands::update_summary,
             commands::add_todo,
             commands::update_todo_text,

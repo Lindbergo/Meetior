@@ -5,7 +5,8 @@
   import MeetingDetail from "./lib/MeetingDetail.svelte";
   import Sidebar, { type Filter } from "./lib/Sidebar.svelte";
   import StartDialog from "./lib/StartDialog.svelte";
-  import { api, events, type Client, type Meeting } from "./lib/api";
+  import SearchResults from "./lib/SearchResults.svelte";
+  import { api, events, type Client, type Meeting, type NoteHit } from "./lib/api";
 
   let meetings = $state<Meeting[]>([]);
   let clients = $state<Client[]>([]);
@@ -13,6 +14,34 @@
   let viewing = $state<string | null>(null);
   let filter = $state<Filter>({ kind: "all" });
   let showStartDialog = $state(false);
+
+  // Notes search state. Empty query → list view; non-empty → search results.
+  // Debounced via $effect so we don't fire a query per keystroke.
+  let query = $state("");
+  let debouncedQuery = $state("");
+  let searchHits = $state<NoteHit[]>([]);
+  let searching = $state(false);
+
+  $effect(() => {
+    const q = query;
+    const id = setTimeout(() => { debouncedQuery = q; }, 200);
+    return () => clearTimeout(id);
+  });
+
+  $effect(() => {
+    const q = debouncedQuery.trim();
+    if (!q) { searchHits = []; return; }
+    const clientFilter = filter.kind === "client" ? filter.id : null;
+    let cancelled = false;
+    searching = true;
+    api.searchNotes(q, clientFilter)
+      .then((hits) => { if (!cancelled) searchHits = hits; })
+      .catch(() => { if (!cancelled) searchHits = []; })
+      .finally(() => { if (!cancelled) searching = false; });
+    return () => { cancelled = true; };
+  });
+
+  const isSearching = $derived(debouncedQuery.trim().length > 0);
 
   let clientsById = $derived(
     Object.fromEntries(clients.map((c) => [c.id, c])) as Record<string, Client>,
@@ -104,7 +133,15 @@
         {:else}{clientsById[filter.id]?.name ?? "Client"}
         {/if}
       </h1>
-      <div class="row">
+      <input
+        class="search"
+        type="search"
+        placeholder={filter.kind === "client"
+          ? `Search notes in ${clientsById[filter.id]?.name ?? "client"}…`
+          : "Search notes…"}
+        bind:value={query}
+      />
+      <div class="row actions">
         {#if active}
           <button class="danger" onclick={handleStop}>Stop meeting</button>
         {:else}
@@ -121,6 +158,14 @@
           id={viewing}
           {clients}
           onBack={() => (viewing = null)}
+        />
+      {:else if isSearching}
+        <SearchResults
+          hits={searchHits}
+          query={debouncedQuery}
+          {searching}
+          {clientsById}
+          onOpen={(id) => (viewing = id)}
         />
       {:else}
         <MeetingList
@@ -157,10 +202,22 @@
   header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    gap: 12px;
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
   }
-  h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; flex: 0 0 auto; }
+  .search {
+    flex: 1;
+    max-width: 320px;
+    background: var(--bg-elev);
+    color: inherit;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font: inherit;
+    font-size: 13px;
+  }
+  .actions { margin-left: auto; }
   .content { flex: 1; overflow: auto; padding: 16px; }
 </style>

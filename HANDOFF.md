@@ -40,6 +40,17 @@ I never opened the Tauri shell. Please `pnpm tauri dev` and walk through:
 - [ ] Todos: click text to edit; **×** to delete; **Add a todo…** input
       with Enter to add
 
+**Notes search (M2c)**
+- [ ] Type a query in the header search box → list view replaces with
+      hits (debounced 200 ms). Clearing the box restores the meeting list.
+- [ ] Active sidebar filter constrains the search ("Search notes in
+      Acme Corp…")
+- [ ] Hit cards show meeting title + client tag + date + "m:ss" + speaker
+      hint, with the matched substring highlighted (`<mark>`)
+- [ ] Click a hit → opens the meeting detail
+- [ ] Try a query containing `%` and `_` — should match those literally
+      (escaping is tested in storage; verify visually)
+
 **End-to-end fixture flow**
 - [ ] `export MEETIOR_FIXTURE_TRANSCRIPT="$PWD/examples/fixture-transcript.json"`
       → start with a client → segments stream → take a few notes →

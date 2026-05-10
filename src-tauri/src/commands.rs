@@ -10,8 +10,8 @@ use tokio::sync::mpsc;
 use crate::asr::{Asr, AsrConfig};
 use crate::audio;
 use crate::meeting::{
-    Client, ClientColor, Meeting, MeetingDetail, MeetingStatus, Note, Session, SpeakerHint, Todo,
-    TranscriptSegment,
+    Client, ClientColor, Meeting, MeetingDetail, MeetingStatus, Note, NoteHit, Session,
+    SpeakerHint, Todo, TranscriptSegment,
 };
 use crate::{AppState, Error, Result};
 
@@ -262,6 +262,19 @@ pub async fn append_note(
         speaker_hint.unwrap_or_default(),
         trimmed,
     )
+}
+
+/// Substring search across notes. `client_id = None` searches all notes;
+/// `Some(id)` constrains to that client's meetings. Empty / whitespace
+/// query returns an empty list (so the UI can call this on every
+/// keystroke without burning the result list).
+#[tauri::command]
+pub async fn search_notes(
+    state: State<'_, AppState>,
+    query: String,
+    client_id: Option<String>,
+) -> Result<Vec<NoteHit>> {
+    state.store.search_notes(&query, client_id.as_deref())
 }
 
 // ----------------------------------------------------------------------
