@@ -47,7 +47,32 @@ impl Store {
         let pool = Pool::new(manager)?;
         let store = Self { pool };
         store.migrate()?;
+        store.recover_orphaned_recordings()?;
         Ok(store)
+    }
+
+    /// On launch, any meeting still in `recording` (or other in-flight)
+    /// status is the leftover of a crash, force-quit, or power loss. Mark
+    /// it `done` with `ended_at = now` so the UI doesn't show it as the
+    /// "currently active" meeting forever. Saved segments and notes are
+    /// preserved — only the meeting row is touched.
+    fn recover_orphaned_recordings(&self) -> Result<()> {
+        let conn = self.pool.get()?;
+        let now = Utc::now().to_rfc3339();
+        let n = conn.execute(
+            "UPDATE meetings
+                SET status = 'done',
+                    ended_at = COALESCE(ended_at, ?1)
+              WHERE status IN ('recording', 'transcribing', 'summarizing')",
+            params![now],
+        )?;
+        if n > 0 {
+            tracing::warn!(
+                count = n,
+                "recovered {n} meeting(s) from in-flight status on launch"
+            );
+        }
+        Ok(())
     }
 
     fn migrate(&self) -> Result<()> {
@@ -1039,6 +1064,119 @@ mod tests {
         s.insert_meeting(&m).unwrap();
         let err = s.delete_todo(&m.id, "nope").unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+    }
+
+    // --- crash recovery on launch --------------------------------------
+
+    #[test]
+    fn launch_recovers_orphaned_recordings() {
+        // Simulate: app crashed mid-meeting; relaunch finds stale state.
+        let path = std::env::temp_dir()
+            .join(format!("meetior_recovery_{}.sqlite", uuid::Uuid::new_v4()));
+
+        {
+            let s = Store::open(&path).unwrap();
+            let m = Meeting::new("interrupted"); // status = Recording
+            s.insert_meeting(&m).unwrap();
+            // Confirm the row really is in `recording`.
+            let listed = s.list_meetings().unwrap();
+            assert_eq!(listed[0].status, MeetingStatus::Recording);
+        } // store drops, pool closes — file persists.
+
+        // Re-open at the same path → simulates a fresh launch after a crash.
+        let s = Store::open(&path).unwrap();
+        let listed = s.list_meetings().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].status,
+            MeetingStatus::Done,
+            "recovery should flip in-flight status to done",
+        );
+        assert!(
+            listed[0].ended_at.is_some(),
+            "recovery should set ended_at when missing",
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn launch_recovery_recovers_all_in_flight_statuses() {
+        let path = std::env::temp_dir()
+            .join(format!("meetior_recovery_{}.sqlite", uuid::Uuid::new_v4()));
+        {
+            let s = Store::open(&path).unwrap();
+            let m1 = Meeting::new("recording");
+            s.insert_meeting(&m1).unwrap();
+            let _ = s.update_meeting_status(&m1.id, MeetingStatus::Recording, None);
+            let m2 = Meeting::new("transcribing");
+            s.insert_meeting(&m2).unwrap();
+            let _ = s.update_meeting_status(&m2.id, MeetingStatus::Transcribing, None);
+            let m3 = Meeting::new("summarizing");
+            s.insert_meeting(&m3).unwrap();
+            let _ = s.update_meeting_status(&m3.id, MeetingStatus::Summarizing, None);
+        }
+        let s = Store::open(&path).unwrap();
+        for m in s.list_meetings().unwrap() {
+            assert_eq!(m.status, MeetingStatus::Done, "{} not recovered", m.title);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn launch_recovery_leaves_done_meetings_untouched() {
+        let path = std::env::temp_dir()
+            .join(format!("meetior_recovery_{}.sqlite", uuid::Uuid::new_v4()));
+        let original_ended = chrono::Utc::now();
+        {
+            let s = Store::open(&path).unwrap();
+            let m = Meeting::new("already done");
+            s.insert_meeting(&m).unwrap();
+            s.update_meeting_status(&m.id, MeetingStatus::Done, Some(original_ended))
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let listed = s.list_meetings().unwrap();
+        assert_eq!(listed[0].status, MeetingStatus::Done);
+        // ended_at must be unchanged — recovery uses COALESCE so an existing
+        // value wins, and the row matched no `WHERE` filter anyway.
+        let listed_ended = listed[0].ended_at.unwrap();
+        assert!(
+            (listed_ended - original_ended).num_seconds().abs() < 2,
+            "ended_at drifted: was {original_ended}, now {listed_ended}",
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn launch_recovery_preserves_segments_and_notes() {
+        let path = std::env::temp_dir()
+            .join(format!("meetior_recovery_{}.sqlite", uuid::Uuid::new_v4()));
+        let m_id = {
+            let s = Store::open(&path).unwrap();
+            let m = Meeting::new("crashed");
+            s.insert_meeting(&m).unwrap();
+            s.append_segment(
+                &m.id,
+                &TranscriptSegment {
+                    start_ms: 0,
+                    end_ms: 500,
+                    speaker: None,
+                    speaker_source: SpeakerSource::Mic,
+                    text: "hello".into(),
+                },
+            )
+            .unwrap();
+            s.append_note(&m.id, 1000, SpeakerHint::You, "important")
+                .unwrap();
+            m.id
+        };
+        let s = Store::open(&path).unwrap();
+        let detail = s.get_meeting_detail(&m_id).unwrap();
+        assert_eq!(detail.meeting.status, MeetingStatus::Done);
+        assert_eq!(detail.segments.len(), 1);
+        assert_eq!(detail.notes.len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     // --- search_notes ---------------------------------------------------
