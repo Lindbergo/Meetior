@@ -1,0 +1,38 @@
+[
+  {
+    "start_ms": 500,
+    "end_ms": 4200,
+    "speaker": "Alice",
+    "text": "Okay let's kick off. Quick standup, then we'll talk about the launch."
+  },
+  {
+    "start_ms": 4500,
+    "end_ms": 9800,
+    "speaker": "Bob",
+    "text": "Yesterday I finished the auth migration. Today I'll start on the billing webhook. Blocked on getting the Stripe test keys from finance."
+  },
+  {
+    "start_ms": 10200,
+    "end_ms": 14600,
+    "speaker": "Alice",
+    "text": "I'll ping Karen for the Stripe keys this afternoon. Bob, can you draft the webhook spec by EOD tomorrow?"
+  },
+  {
+    "start_ms": 15000,
+    "end_ms": 17000,
+    "speaker": "Bob",
+    "text": "Yep, I'll have it ready."
+  },
+  {
+    "start_ms": 17500,
+    "end_ms": 23800,
+    "speaker": "Carol",
+    "text": "On the launch — marketing wants the blog post by next Wednesday. I need final copy from product by Monday so we have time to edit."
+  },
+  {
+    "start_ms": 24200,
+    "end_ms": 27500,
+    "speaker": "Alice",
+    "text": "I'll own the copy. Monday morning works. Anything else? Okay, thanks everyone."
+  }
+]

@@ -1,0 +1,84 @@
+[package]
+name = "meetior"
+version = "0.1.0"
+description = "Local meeting transcription & summarization for Google Meet"
+authors = ["Meetior"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "meetior_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# IDs / time
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+
+# HTTP (Ollama client, model download)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+bytes = "1"
+
+# Audio (cross-platform mic; system audio is mac-specific below)
+cpal = "0.15"
+
+# Resampling / DSP for ASR pre-processing
+rubato = "0.16"
+
+# ASR — ONNX Runtime
+# Note: requires the ONNX Runtime dynamic library on the system at runtime.
+# See CLAUDE.md "Setup" for installation.
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["ndarray", "load-dynamic"] }
+ndarray = "0.16"
+
+# Tokenizer for Parakeet (SentencePiece BPE)
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+# Voice activity detection (used for chunking + future auto-detection)
+voice_activity_detector = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# System audio capture via ScreenCaptureKit (macOS 13+)
+# We pin a known-good version; adjust per CLAUDE.md notes.
+screencapturekit = "0.3"
+core-foundation = "0.10"
+
+[dev-dependencies]
+wiremock = "0.6"
+
+[features]
+# By default we do not require a custom protocol; this is here for future use
+default = []
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
