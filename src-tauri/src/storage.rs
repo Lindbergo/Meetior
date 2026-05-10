@@ -464,18 +464,81 @@ impl Store {
             "UPDATE todos SET done = 1 - done WHERE id = ?1 AND meeting_id = ?2",
             params![todo_id, meeting_id],
         )?;
-        let t = conn
-            .query_row(
-                "SELECT id, text, done FROM todos WHERE id = ?1 AND meeting_id = ?2",
-                params![todo_id, meeting_id],
-                |r| {
-                    Ok(Todo {
-                        id: r.get(0)?,
-                        text: r.get(1)?,
-                        done: r.get::<_, i64>(2)? != 0,
-                    })
-                },
-            )
+        self.get_todo(meeting_id, todo_id)
+    }
+
+    /// Update only the summary text (preserves todos). Used by the
+    /// edit-summary affordance in the detail view.
+    pub fn update_summary_text(&self, meeting_id: &str, summary: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE summaries SET summary = ?2 WHERE meeting_id = ?1",
+            params![meeting_id, summary],
+        )?;
+        if n == 0 {
+            // No row yet — first edit before AI summary exists. Insert one.
+            conn.execute(
+                "INSERT INTO summaries (meeting_id, summary, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![meeting_id, summary, Utc::now().to_rfc3339()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Append a manual todo. The id is generated server-side so the UI
+    /// receives a fully-formed Todo to render immediately.
+    pub fn add_todo(&self, meeting_id: &str, text: &str) -> Result<Todo> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let conn = self.pool.get()?;
+        // Verify meeting exists so we get a clean NotFound rather than a FK
+        // violation surfaced as a generic SQL error.
+        let _ = self.get_meeting_row(meeting_id)?;
+        conn.execute(
+            "INSERT INTO todos (id, meeting_id, text, done, created_at)
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            params![id, meeting_id, text, Utc::now().to_rfc3339()],
+        )?;
+        Ok(Todo { id, text: text.to_string(), done: false })
+    }
+
+    pub fn update_todo_text(&self, meeting_id: &str, todo_id: &str, text: &str) -> Result<Todo> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE todos SET text = ?3 WHERE id = ?1 AND meeting_id = ?2",
+            params![todo_id, meeting_id, text],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("todo {todo_id}")));
+        }
+        self.get_todo(meeting_id, todo_id)
+    }
+
+    pub fn delete_todo(&self, meeting_id: &str, todo_id: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "DELETE FROM todos WHERE id = ?1 AND meeting_id = ?2",
+            params![todo_id, meeting_id],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("todo {todo_id}")));
+        }
+        Ok(())
+    }
+
+    fn get_todo(&self, meeting_id: &str, todo_id: &str) -> Result<Todo> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, text, done FROM todos WHERE id = ?1 AND meeting_id = ?2",
+        )?;
+        let t = stmt
+            .query_row(params![todo_id, meeting_id], |r| {
+                Ok(Todo {
+                    id: r.get(0)?,
+                    text: r.get(1)?,
+                    done: r.get::<_, i64>(2)? != 0,
+                })
+            })
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
                     Error::NotFound(format!("todo {todo_id}"))
@@ -836,5 +899,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(leftover, 0);
+    }
+
+    // --- granular summary + todo edits ---------------------------------
+
+    #[test]
+    fn update_summary_text_creates_then_updates() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+
+        // First call inserts (no AI summary yet).
+        s.update_summary_text(&m.id, "user-written summary").unwrap();
+        let detail = s.get_meeting_detail(&m.id).unwrap();
+        assert_eq!(detail.summary.as_deref(), Some("user-written summary"));
+
+        // Second call updates in place; existing todos unaffected.
+        let todo = Todo { id: "t1".into(), text: "x".into(), done: false };
+        s.save_summary(&m.id, "ai summary", &[todo]).unwrap();
+        s.update_summary_text(&m.id, "edited by user").unwrap();
+
+        let detail = s.get_meeting_detail(&m.id).unwrap();
+        assert_eq!(detail.summary.as_deref(), Some("edited by user"));
+        assert_eq!(detail.todos.len(), 1, "todos must survive a summary edit");
+    }
+
+    #[test]
+    fn add_todo_appends_manual_item() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+        let ai = Todo { id: "ai".into(), text: "ai item".into(), done: false };
+        s.save_summary(&m.id, "x", &[ai]).unwrap();
+
+        let manual = s.add_todo(&m.id, "manual item").unwrap();
+        assert!(!manual.done);
+        assert_eq!(manual.text, "manual item");
+
+        let detail = s.get_meeting_detail(&m.id).unwrap();
+        let texts: Vec<_> = detail.todos.iter().map(|t| t.text.clone()).collect();
+        assert_eq!(texts, vec!["ai item", "manual item"]);
+    }
+
+    #[test]
+    fn add_todo_on_unknown_meeting_returns_not_found() {
+        let s = store();
+        let err = s.add_todo("not-a-meeting", "x").unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn update_todo_text_changes_only_text() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+        let todo = Todo { id: "t1".into(), text: "original".into(), done: true };
+        s.save_summary(&m.id, "x", &[todo]).unwrap();
+
+        let updated = s.update_todo_text(&m.id, "t1", "edited").unwrap();
+        assert_eq!(updated.text, "edited");
+        assert!(updated.done, "done flag must be preserved across text edits");
+    }
+
+    #[test]
+    fn delete_todo_removes_only_target() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+        let a = Todo { id: "a".into(), text: "keep".into(), done: false };
+        let b = Todo { id: "b".into(), text: "drop".into(), done: false };
+        s.save_summary(&m.id, "x", &[a, b]).unwrap();
+
+        s.delete_todo(&m.id, "b").unwrap();
+        let detail = s.get_meeting_detail(&m.id).unwrap();
+        let ids: Vec<_> = detail.todos.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(ids, vec!["a"]);
+    }
+
+    #[test]
+    fn delete_todo_unknown_returns_not_found() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+        let err = s.delete_todo(&m.id, "nope").unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
     }
 }

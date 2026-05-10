@@ -61,6 +61,17 @@ pub fn run() {
             commands::get_meeting,
             commands::summarize_meeting,
             commands::toggle_todo,
+            commands::create_client,
+            commands::list_clients,
+            commands::update_client,
+            commands::delete_client,
+            commands::update_meeting_title,
+            commands::set_meeting_client,
+            commands::append_note,
+            commands::update_summary,
+            commands::add_todo,
+            commands::update_todo_text,
+            commands::delete_todo,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

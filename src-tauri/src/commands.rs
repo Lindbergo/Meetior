@@ -9,7 +9,10 @@ use tokio::sync::mpsc;
 
 use crate::asr::{Asr, AsrConfig};
 use crate::audio;
-use crate::meeting::{Meeting, MeetingDetail, MeetingStatus, Session, Todo, TranscriptSegment};
+use crate::meeting::{
+    Client, ClientColor, Meeting, MeetingDetail, MeetingStatus, Note, Session, SpeakerHint, Todo,
+    TranscriptSegment,
+};
 use crate::{AppState, Error, Result};
 
 const EVT_TRANSCRIPT_SEGMENT: &str = "meetior://transcript-segment";
@@ -20,6 +23,7 @@ pub async fn start_meeting(
     app: AppHandle,
     state: State<'_, AppState>,
     title: Option<String>,
+    client_id: Option<String>,
 ) -> Result<Meeting> {
     let mut session_slot = state.session.lock().await;
     if session_slot.is_some() {
@@ -29,7 +33,7 @@ pub async fn start_meeting(
     let title = title.unwrap_or_else(|| {
         format!("Meeting {}", Utc::now().format("%Y-%m-%d %H:%M"))
     });
-    let meeting = Meeting::new(title);
+    let meeting = Meeting::new(title).with_client(client_id);
     state.store.insert_meeting(&meeting)?;
 
     // Capture → ASR → store + emit.
@@ -149,6 +153,164 @@ pub async fn toggle_todo(
     todo_id: String,
 ) -> Result<Todo> {
     state.store.toggle_todo(&meeting_id, &todo_id)
+}
+
+// ----------------------------------------------------------------------
+// Clients
+// ----------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn create_client(state: State<'_, AppState>, name: String) -> Result<Client> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidState("client name cannot be empty".into()));
+    }
+    state.store.create_client(trimmed)
+}
+
+#[tauri::command]
+pub async fn list_clients(state: State<'_, AppState>) -> Result<Vec<Client>> {
+    state.store.list_clients()
+}
+
+#[tauri::command]
+pub async fn update_client(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+    color: String,
+) -> Result<Client> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidState("client name cannot be empty".into()));
+    }
+    let color = ClientColor::from_str(&color)
+        .ok_or_else(|| Error::InvalidState(format!("unknown color: {color}")))?;
+    state.store.update_client(&id, trimmed, color)
+}
+
+#[tauri::command]
+pub async fn delete_client(state: State<'_, AppState>, id: String) -> Result<()> {
+    state.store.delete_client(&id)
+}
+
+// ----------------------------------------------------------------------
+// Meeting edits
+// ----------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn update_meeting_title(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    title: String,
+) -> Result<Meeting> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidState("title cannot be empty".into()));
+    }
+    let m = state.store.update_meeting(&id, Some(trimmed), None)?;
+    let _ = app.emit(EVT_MEETING_STATUS, &m);
+    Ok(m)
+}
+
+/// Assign or unassign a client. `client_id = None` moves the meeting to
+/// "Unassigned"; `Some(id)` assigns to that client.
+#[tauri::command]
+pub async fn set_meeting_client(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    meeting_id: String,
+    client_id: Option<String>,
+) -> Result<Meeting> {
+    // Validate the client exists if one was passed.
+    if let Some(cid) = &client_id {
+        let _ = state.store.get_client(cid)?;
+    }
+    let m = state
+        .store
+        .update_meeting(&meeting_id, None, Some(client_id.as_deref()))?;
+    let _ = app.emit(EVT_MEETING_STATUS, &m);
+    Ok(m)
+}
+
+// ----------------------------------------------------------------------
+// Notes
+// ----------------------------------------------------------------------
+
+/// Append a line to the live notes pane. `t_ms` is computed server-side
+/// from the meeting's `started_at` so timing stays consistent across clients
+/// and survives a clock change.
+#[tauri::command]
+pub async fn append_note(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    text: String,
+    speaker_hint: Option<SpeakerHint>,
+) -> Result<Note> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidState("note text cannot be empty".into()));
+    }
+    let meeting = state.store.get_meeting_detail(&meeting_id)?.meeting;
+    let elapsed_ms = (Utc::now() - meeting.started_at)
+        .num_milliseconds()
+        .max(0) as u64;
+    state.store.append_note(
+        &meeting_id,
+        elapsed_ms,
+        speaker_hint.unwrap_or_default(),
+        trimmed,
+    )
+}
+
+// ----------------------------------------------------------------------
+// Summary + todo edits
+// ----------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn update_summary(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    summary: String,
+) -> Result<()> {
+    state.store.update_summary_text(&meeting_id, &summary)
+}
+
+#[tauri::command]
+pub async fn add_todo(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    text: String,
+) -> Result<Todo> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidState("todo text cannot be empty".into()));
+    }
+    state.store.add_todo(&meeting_id, trimmed)
+}
+
+#[tauri::command]
+pub async fn update_todo_text(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    todo_id: String,
+    text: String,
+) -> Result<Todo> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidState("todo text cannot be empty".into()));
+    }
+    state.store.update_todo_text(&meeting_id, &todo_id, trimmed)
+}
+
+#[tauri::command]
+pub async fn delete_todo(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    todo_id: String,
+) -> Result<()> {
+    state.store.delete_todo(&meeting_id, &todo_id)
 }
 
 #[derive(serde::Serialize)]

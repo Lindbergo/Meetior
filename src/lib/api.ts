@@ -74,11 +74,38 @@ export interface MeetingDetail extends Meeting {
 }
 
 export const api = {
-  startMeeting: (title?: string) => invoke<Meeting>("start_meeting", { title }),
+  // meetings
+  startMeeting: (title?: string, clientId?: string | null) =>
+    invoke<Meeting>("start_meeting", { title, clientId }),
   stopMeeting: (id: string) => invoke<Meeting>("stop_meeting", { id }),
   listMeetings: () => invoke<Meeting[]>("list_meetings"),
   getMeeting: (id: string) => invoke<MeetingDetail>("get_meeting", { id }),
   summarize: (id: string) => invoke<MeetingDetail>("summarize_meeting", { id }),
+  updateMeetingTitle: (id: string, title: string) =>
+    invoke<Meeting>("update_meeting_title", { id, title }),
+  setMeetingClient: (meetingId: string, clientId: string | null) =>
+    invoke<Meeting>("set_meeting_client", { meetingId, clientId }),
+
+  // clients
+  createClient: (name: string) => invoke<Client>("create_client", { name }),
+  listClients: () => invoke<Client[]>("list_clients"),
+  updateClient: (id: string, name: string, color: ClientColor) =>
+    invoke<Client>("update_client", { id, name, color }),
+  deleteClient: (id: string) => invoke<void>("delete_client", { id }),
+
+  // notes
+  appendNote: (meetingId: string, text: string, speakerHint?: SpeakerHint) =>
+    invoke<Note>("append_note", { meetingId, text, speakerHint }),
+
+  // summary + todos
+  updateSummary: (meetingId: string, summary: string) =>
+    invoke<void>("update_summary", { meetingId, summary }),
+  addTodo: (meetingId: string, text: string) =>
+    invoke<Todo>("add_todo", { meetingId, text }),
+  updateTodoText: (meetingId: string, todoId: string, text: string) =>
+    invoke<Todo>("update_todo_text", { meetingId, todoId, text }),
+  deleteTodo: (meetingId: string, todoId: string) =>
+    invoke<void>("delete_todo", { meetingId, todoId }),
   toggleTodo: (meetingId: string, todoId: string) =>
     invoke<Todo>("toggle_todo", { meetingId, todoId }),
 };
