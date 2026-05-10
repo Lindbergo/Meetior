@@ -21,6 +21,7 @@
   let { clients, counts, filter, onSelect, onCreateClient }: Props = $props();
 
   let creating = $state(false);
+  let saving = $state(false);
   let newName = $state("");
   let creatingError = $state<string | null>(null);
   let inputEl: HTMLInputElement | null = $state(null);
@@ -39,16 +40,20 @@
   }
 
   async function submitCreate() {
+    if (saving) return;  // Guard against rapid double-Enter creating two clients.
     const trimmed = newName.trim();
     if (!trimmed) {
       cancelCreate();
       return;
     }
+    saving = true;
     try {
       await onCreateClient(trimmed);
       cancelCreate();
     } catch (e) {
       creatingError = String(e);
+    } finally {
+      saving = false;
     }
   }
 
@@ -98,11 +103,12 @@
           bind:this={inputEl}
           bind:value={newName}
           placeholder="Client name"
+          disabled={saving}
           onkeydown={(e) => {
             if (e.key === "Enter") submitCreate();
             else if (e.key === "Escape") cancelCreate();
           }}
-          onblur={() => { if (!newName.trim()) cancelCreate(); }}
+          onblur={() => { if (!saving && !newName.trim()) cancelCreate(); }}
         />
       </div>
       {#if creatingError}

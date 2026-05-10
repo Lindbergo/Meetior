@@ -23,17 +23,12 @@ pub enum MeetingStatus {
 
 /// How a meeting got into the system. `Live` = recorded with mic + system
 /// audio. `Imported` = decoded from an audio file the user dropped in.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MeetingSource {
+    #[default]
     Live,
     Imported,
-}
-
-impl Default for MeetingSource {
-    fn default() -> Self {
-        Self::Live
-    }
 }
 
 /// Which capture stream a transcript segment came from.
@@ -41,18 +36,13 @@ impl Default for MeetingSource {
 /// Used as a cheap proxy for "you vs them" labelling in the UI without real
 /// diarization (M3+). For fixture / imported audio we don't know, so the
 /// default is `Unknown`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SpeakerSource {
     Mic,
     System,
+    #[default]
     Unknown,
-}
-
-impl Default for SpeakerSource {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 /// Speaker hint stamped on a Note when the user finalizes a line.
@@ -60,18 +50,13 @@ impl Default for SpeakerSource {
 /// Derived from which audio source has been louder in the recent window when
 /// the user pressed Enter. Kept separate from `SpeakerSource` because the
 /// note is user-facing and the segment is internal.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SpeakerHint {
     You,
     Them,
+    #[default]
     Unknown,
-}
-
-impl Default for SpeakerHint {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 /// Curated palette for clients (see PRODUCT.md → Decisions → Color palette).
@@ -288,5 +273,93 @@ mod tests {
         for c in ClientColor::PALETTE {
             assert_eq!(ClientColor::from_str(c.as_str()), Some(c));
         }
+    }
+
+    /// Snapshot of the JSON keys we ship across the Tauri IPC boundary.
+    ///
+    /// This catches the failure mode where someone adds / renames a Rust
+    /// field but forgets to update `src/lib/api.ts`. A breakage here means
+    /// the frontend `interface` is out of sync — the runtime symptom would
+    /// be silent `undefined` reads in Svelte components, which type-check
+    /// can't detect since TS believes the type definition.
+    ///
+    /// If a key changes intentionally, update both this test and api.ts in
+    /// the same commit.
+    #[test]
+    fn ipc_payload_field_names_are_frozen() {
+        use serde_json::Value;
+
+        fn keys(v: Value) -> Vec<String> {
+            let mut k: Vec<String> = v
+                .as_object()
+                .expect("expected object")
+                .keys()
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        }
+
+        let meeting = Meeting::new("t");
+        assert_eq!(
+            keys(serde_json::to_value(&meeting).unwrap()),
+            vec![
+                "client_id",
+                "ended_at",
+                "id",
+                "source",
+                "started_at",
+                "status",
+                "title",
+            ],
+        );
+
+        let client = Client::new("Acme", ClientColor::Red);
+        assert_eq!(
+            keys(serde_json::to_value(&client).unwrap()),
+            vec!["color", "created_at", "id", "name"],
+        );
+
+        let note = Note {
+            idx: 0,
+            t_ms: 1000,
+            speaker_hint: SpeakerHint::You,
+            text: "hi".into(),
+        };
+        assert_eq!(
+            keys(serde_json::to_value(&note).unwrap()),
+            vec!["idx", "speaker_hint", "t_ms", "text"],
+        );
+
+        let hit = NoteHit {
+            meeting_id: "m".into(),
+            meeting_title: "t".into(),
+            meeting_started_at: chrono::Utc::now(),
+            client_id: None,
+            idx: 0,
+            t_ms: 0,
+            speaker_hint: SpeakerHint::Unknown,
+            text: "".into(),
+        };
+        assert_eq!(
+            keys(serde_json::to_value(&hit).unwrap()),
+            vec![
+                "client_id",
+                "idx",
+                "meeting_id",
+                "meeting_started_at",
+                "meeting_title",
+                "speaker_hint",
+                "t_ms",
+                "text",
+            ],
+        );
+
+        // Enum variants serialize lowercase (rename_all attribute on each).
+        assert_eq!(serde_json::to_value(SpeakerHint::You).unwrap(), "you");
+        assert_eq!(serde_json::to_value(SpeakerSource::Mic).unwrap(), "mic");
+        assert_eq!(serde_json::to_value(MeetingSource::Imported).unwrap(), "imported");
+        assert_eq!(serde_json::to_value(ClientColor::Indigo).unwrap(), "indigo");
+        assert_eq!(serde_json::to_value(MeetingStatus::Recording).unwrap(), "recording");
     }
 }
