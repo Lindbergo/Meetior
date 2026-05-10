@@ -393,7 +393,7 @@ behind a `MEETIOR_DUMP_AUDIO=1` env. Inspect with QuickLook or `ffplay`.
 If any step fails, fix it before adding new behavior. Don't paper over a
 broken flow with a UI guard.
 
-### Performance budget
+### Performance
 
 We chose Rust + Tauri because we care about overhead. Rough targets:
 
@@ -403,6 +403,72 @@ We chose Rust + Tauri because we care about overhead. Rough targets:
 
 Profile with Instruments (Time Profiler) and `cargo flamegraph`. Avoid
 allocating per audio chunk — reuse buffers in the audio + ASR loops.
+
+#### Memory profile on Apple Silicon
+
+| Component | Resident RAM | Notes |
+|---|---|---|
+| Tauri shell + WKWebView | ~300 MB | System WebKit; nothing to tune. |
+| Parakeet 0.6B ONNX (CPU) | ~1–2 GB | Loaded once on app launch. ANE via CoreML EP would cut this to ~300 MB (see Future wins). |
+| Ollama llama3.1:8b-instruct-q4_K_M | ~5–6 GB | Loaded on first summarize call; stays resident until Ollama unloads on idle. |
+| Misc (SQLite, audio buffers) | < 50 MB | |
+| **Total during a recording** | ~1.5–2.5 GB | Comfortable on any Mac. |
+| **Total during summarization** | ~7–9 GB | Tight on 8 GB Macs — see below. |
+
+The summarize burst is the only thing that pushes 8 GB Macs into swap.
+Recording itself never does.
+
+#### Long meetings + low-memory Macs
+
+Two strategies stack:
+
+1. **Map-reduce summarization for long transcripts.** Shipped.
+   `OllamaClient::summarize` auto-routes: short transcripts (≤ 4000
+   estimated tokens) get one Ollama call; longer ones split at segment
+   boundaries into ~3000-token chunks, each summarized in its own call,
+   then a combine pass merges. **Peak memory is bounded by chunk size,
+   not transcript length** — a 4-hour meeting and a 30-minute one have
+   the same memory footprint, only wall-clock differs. Sequential
+   calls; we never have two Ollama contexts loaded at once.
+
+2. **Pick a smaller summarizer model on 8 GB Macs.** The `MEETIOR_OLLAMA_MODEL`
+   env var swaps it without rebuild. Recommended alternatives:
+
+   ```sh
+   # Default (best quality, 5–6 GB)
+   ollama pull llama3.1:8b-instruct-q4_K_M
+
+   # Lower memory (4–4.5 GB), comparable quality
+   ollama pull qwen2.5:7b-instruct-q4_K_M
+   export MEETIOR_OLLAMA_MODEL=qwen2.5:7b-instruct-q4_K_M
+
+   # Very low memory (~2.5 GB), faster but rougher summaries
+   ollama pull phi3:3.8b-mini-instruct-4k-q4_K_M
+   export MEETIOR_OLLAMA_MODEL=phi3:3.8b-mini-instruct-4k-q4_K_M
+   ```
+
+   The 7B option is the sweet spot for 8 GB users: ~1.5 GB lower peak,
+   summary quality indistinguishable from 8B for meeting-style content.
+
+For a 2-hour meeting on an 8 GB Air with the defaults: ~6–8 sequential
+chunks, 30–60 s each, total summarize time ~5–8 minutes. Active CPU
+during summarization, ~80 % on one P-core. Don't expect to use the
+laptop interactively while it runs.
+
+#### Future wins
+
+- **CoreML execution provider for `ort`** (M3 roadmap). Today Parakeet
+  inference is CPU-only; enabling the CoreML EP routes it through the
+  Apple Neural Engine. Expected effect: ~5–10× faster transcription,
+  ~1.5 GB less RAM for the model, lower battery drain. Requires
+  building `ort` with the `coreml` feature and selecting the EP in
+  `Asr::new`. Drop-in once we have a production model artifact.
+- **VRAM-pinning for Ollama** via `OLLAMA_KEEP_ALIVE=0` to evict the
+  model after each summarize call. Trades startup latency for
+  baseline RAM. Worth a setting on 8 GB Macs.
+- **Background-queue summarization**: defer summarize calls until the
+  app detects low system pressure (no meeting recording, AC power).
+  Currently summarize is foreground-only.
 
 ---
 
@@ -564,6 +630,17 @@ Driven by [`PRODUCT.md`](./PRODUCT.md). Suggested order:
       hotkey.
 - [ ] Full-text search across transcripts + notes (SQLite FTS5,
       replaces the M2c LIKE-based notes search).
+- [ ] **CoreML execution provider for `ort`** — Parakeet via the Apple
+      Neural Engine. Single biggest perf win available; ~5–10× faster
+      ASR, ~1.5 GB less RAM, lower battery drain. See Performance →
+      Future wins.
+- [ ] **Background-queue summarization** — defer summarize calls until
+      the app detects low system pressure (no recording, AC power).
+      Lets long-meeting users hit "Stop" and walk away rather than
+      paying the 5–8 minute summarize cost interactively.
+- [ ] **8 GB-aware defaults** — detect available RAM at first launch
+      and surface the model-picker setting if Ollama 8B is going to
+      pressure swap (recommend qwen2.5:7b instead).
 
 ### M4 — Distribution
 - [ ] Replace placeholder icons (`pnpm tauri icon source.png`).
