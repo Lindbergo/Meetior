@@ -12,6 +12,7 @@
 //! [`M2A-PLAN.md`](../../../M2A-PLAN.md) for the staging.
 
 pub mod mel;
+pub mod tokenizer;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
