@@ -203,10 +203,23 @@ and a handful of correctness issues svelte-check waves through. Cheap
 
 ### UI-only iteration (no Tauri shell)
 
-When iterating on Svelte, run Vite alone and stub the backend in
-`src/lib/api.ts` behind a `import.meta.env.DEV && !window.__TAURI_INTERNALS__`
-guard so the UI renders with fake data. Faster than rebuilding Rust. Don't
-commit the stubs — guard them or keep them in a local dev branch.
+When iterating on Svelte (and on any non-macOS box), run Vite alone with
+`pnpm dev`. The IPC layer auto-routes to the in-memory stub in
+[`src/lib/api-stub.ts`](./src/lib/api-stub.ts) when `__TAURI_INTERNALS__`
+isn't on `window` — full UI flows work without macOS, ScreenCaptureKit,
+or Ollama. State persists to `localStorage`; reset via
+`window.meetiorResetStub()` in the devtools console.
+
+The stub mirrors the real backend's behavior: client color auto-assign,
+`delete_client` cascading to `client_id = NULL`, `start_meeting`
+replaying the same fixture transcript on its real timestamps, fake
+Ollama summary after a small delay, etc. It's not a substitute for
+macOS verification of mic / system-audio / ONNX paths, but for "does
+the UI hang together" it's enough.
+
+When you add a new Tauri command, add the matching handler to
+`api-stub.ts` in the same commit. The stub is the contract we ship for
+non-macOS development.
 
 ### Unit testing the backend
 
@@ -231,25 +244,63 @@ mod tests {
 ```
 
 Conventions:
-- `storage.rs` tests use `:memory:` SQLite — no temp files, no cleanup.
+- `storage.rs` tests use a per-test temp file under `std::env::temp_dir()`.
+  r2d2 + SqliteConnectionManager makes shared `:memory:` awkward; the
+  files leak until process exit, which is fine at our test count.
+  Reconsider if it grows.
 - `summarizer.rs` tests hit a fake Ollama via `wiremock` (add to dev-deps
   when needed) or skip when `MEETIOR_OLLAMA_HOST` is unset.
-- `audio.rs` / `asr.rs` tests use **fixture WAVs** under
-  `src-tauri/tests/fixtures/`. Keep them short (≤ 5 s) and check expected
-  text loosely — exact ASR output is brittle. Word-error-rate against a
-  reference is fine.
+- `audio.rs` tests use the in-test `write_wav` helper to synthesize WAVs
+  on the fly — no binary fixtures committed. `asr/mel.rs` tests likewise
+  generate synthetic sine waves. Real Parakeet WER tests will need
+  fixture WAVs under `src-tauri/tests/fixtures/` once M2a step 3 lands;
+  keep them short (≤ 5 s) and assert WER against a reference, not exact
+  text.
 - Integration tests covering Tauri commands go in `src-tauri/tests/`. Use
   `tauri::test::mock_app()` rather than spinning a real window.
 
+**The streaming-correctness pattern.** Anything that processes a stream
+of input incrementally (audio resample, mel-spec, future BPE decoder)
+should have a `streaming_matches_batch` test:
+`processor.process(a) ++ processor.process(b)` must equal
+`fresh_processor.process(a ++ b)` within float tolerance. Stronger
+versions iterate over many split offsets — see
+`asr::mel::tests::streaming_handles_chunk_boundary_at_every_offset`. This
+single test catches an enormous class of off-by-one + leftover-buffer
+bugs that no other unit test reliably finds.
+
+**Trait-decouple library wrappers.** When wrapping an external library
+(`tokenizers`, `ort`, etc.), define a small in-crate trait the rest of
+the code uses. The production wrapper implements it; tests get a mock
+without pulling the library into the test setup. Example:
+`asr::tokenizer::Tokenizer` trait + `BpeTokenizer` (real) +
+`MockTokenizer` (in-test). Streaming logic is fully tested without ever
+loading a `tokenizer.json`.
+
 ### Iterating on the stubs without macOS audio
 
-You don't need ScreenCaptureKit working to make progress on the rest of
-the pipeline.
+You don't need ScreenCaptureKit (or even a microphone) working to make
+progress on the rest of the pipeline.
 
-**Faux ASR — already implemented.** Set `MEETIOR_FIXTURE_TRANSCRIPT` to a
-JSON file of `TranscriptSegment`s and `commands::start_meeting` will replay
-it on a timer instead of starting real audio capture. A sample is shipped
-at `examples/fixture-transcript.json`:
+**The fixture-fallback pattern.** Whenever we depend on something that
+isn't fully testable in agent / Linux dev environments (real audio, the
+Parakeet model, ScreenCaptureKit, Ollama for actual generation), we
+ship a `MEETIOR_FIXTURE_*` env var that bypasses it with canned data.
+That keeps every other layer iterable. Two are live:
+
+- `MEETIOR_FIXTURE_TRANSCRIPT=path/to/segments.json` — bypasses audio
+  + ASR entirely; `commands::start_meeting` replays the segments on a
+  timer. Sample at `examples/fixture-transcript.json`.
+- `MEETIOR_FIXTURE_AUDIO=path/to/file.wav` — bypasses the mic;
+  `audio::start_capture` decodes the file via `hound` and emits real
+  `AudioChunk`s at real-time pace. Useful once M2a step 3 (Parakeet
+  inference) lands and we want to test the audio→mel→ASR pipeline
+  without speaking into a microphone.
+
+When you add a new external dependency, ship the fixture variant in
+the same PR as the real path — even before the real path is wired.
+
+**Faux ASR — fixture transcript:**
 
 ```sh
 export MEETIOR_FIXTURE_TRANSCRIPT="$PWD/examples/fixture-transcript.json"
@@ -260,10 +311,44 @@ Click **Start meeting** → segments stream into the active view at their
 real timestamps → click **Stop** → open the meeting → **Generate summary &
 todos** hits Ollama. Full flow without Parakeet or ScreenCaptureKit.
 
-**Faux audio capture** is *not yet implemented*. When we need it (e.g. to
-test the mel-spec pipeline against a known WAV), add `MEETIOR_FIXTURE_AUDIO`
-in `audio.rs` symmetrically. Don't let either grow features — they exist so
-M2 work doesn't block M3 work.
+**Faux audio capture (shipped in M2a step 1):**
+
+```sh
+export MEETIOR_FIXTURE_AUDIO="$PWD/examples/fixture-audio.wav"
+pnpm tauri dev
+```
+
+Skips the cpal mic entirely; useful for testing the mel-spec → ASR
+pipeline against a known WAV without a microphone. Don't let either
+fixture path grow features — they exist so each M2/M3 step doesn't
+block the next.
+
+### Working without macOS access
+
+Real chunks of this project can be built and verified from a Linux box,
+a phone-driven agent session, or anywhere `cargo` and `pnpm` work.
+What's testable, what isn't:
+
+| Layer | Testable from Linux | Needs macOS |
+|---|---|---|
+| Storage / commands / domain types | yes (`cargo test --lib`) | no |
+| Audio DSP (resample, mixdown, chunking, mel-spec) | yes (synthetic inputs, streaming-correctness pattern) | no |
+| Tokenizer + streaming detokenizer | yes (mock vocab) | no |
+| Frontend logic + click-throughs | yes (`pnpm dev` + `api-stub.ts`; see "UI-only iteration") | no |
+| cpal mic device handshake + permission prompt | no | yes |
+| ScreenCaptureKit system audio | no | yes (M2a step 4) |
+| Parakeet ONNX inference correctness | no | needs model files (any platform) |
+| Live-mic resampling latency vs. perf budget | no | yes |
+
+Each step that ships should split its commit message into "verified by
+tests" vs. "pending macOS verification" so the next session knows where
+to focus when they're back at a Mac. `HANDOFF.md` is the durable home
+for the latter list.
+
+When in doubt about whether something is testable from Linux: write the
+test. If `cargo test --lib` covers it, it's a Linux-friendly piece. If
+it requires a real device or model artifact, document the trust
+boundary and move on.
 
 ### Logging & inspection
 
@@ -308,7 +393,7 @@ behind a `MEETIOR_DUMP_AUDIO=1` env. Inspect with QuickLook or `ffplay`.
 If any step fails, fix it before adding new behavior. Don't paper over a
 broken flow with a UI guard.
 
-### Performance budget
+### Performance
 
 We chose Rust + Tauri because we care about overhead. Rough targets:
 
@@ -318,6 +403,72 @@ We chose Rust + Tauri because we care about overhead. Rough targets:
 
 Profile with Instruments (Time Profiler) and `cargo flamegraph`. Avoid
 allocating per audio chunk — reuse buffers in the audio + ASR loops.
+
+#### Memory profile on Apple Silicon
+
+| Component | Resident RAM | Notes |
+|---|---|---|
+| Tauri shell + WKWebView | ~300 MB | System WebKit; nothing to tune. |
+| Parakeet 0.6B ONNX (CPU) | ~1–2 GB | Loaded once on app launch. ANE via CoreML EP would cut this to ~300 MB (see Future wins). |
+| Ollama llama3.1:8b-instruct-q4_K_M | ~5–6 GB | Loaded on first summarize call; stays resident until Ollama unloads on idle. |
+| Misc (SQLite, audio buffers) | < 50 MB | |
+| **Total during a recording** | ~1.5–2.5 GB | Comfortable on any Mac. |
+| **Total during summarization** | ~7–9 GB | Tight on 8 GB Macs — see below. |
+
+The summarize burst is the only thing that pushes 8 GB Macs into swap.
+Recording itself never does.
+
+#### Long meetings + low-memory Macs
+
+Two strategies stack:
+
+1. **Map-reduce summarization for long transcripts.** Shipped.
+   `OllamaClient::summarize` auto-routes: short transcripts (≤ 4000
+   estimated tokens) get one Ollama call; longer ones split at segment
+   boundaries into ~3000-token chunks, each summarized in its own call,
+   then a combine pass merges. **Peak memory is bounded by chunk size,
+   not transcript length** — a 4-hour meeting and a 30-minute one have
+   the same memory footprint, only wall-clock differs. Sequential
+   calls; we never have two Ollama contexts loaded at once.
+
+2. **Pick a smaller summarizer model on 8 GB Macs.** The `MEETIOR_OLLAMA_MODEL`
+   env var swaps it without rebuild. Recommended alternatives:
+
+   ```sh
+   # Default (best quality, 5–6 GB)
+   ollama pull llama3.1:8b-instruct-q4_K_M
+
+   # Lower memory (4–4.5 GB), comparable quality
+   ollama pull qwen2.5:7b-instruct-q4_K_M
+   export MEETIOR_OLLAMA_MODEL=qwen2.5:7b-instruct-q4_K_M
+
+   # Very low memory (~2.5 GB), faster but rougher summaries
+   ollama pull phi3:3.8b-mini-instruct-4k-q4_K_M
+   export MEETIOR_OLLAMA_MODEL=phi3:3.8b-mini-instruct-4k-q4_K_M
+   ```
+
+   The 7B option is the sweet spot for 8 GB users: ~1.5 GB lower peak,
+   summary quality indistinguishable from 8B for meeting-style content.
+
+For a 2-hour meeting on an 8 GB Air with the defaults: ~6–8 sequential
+chunks, 30–60 s each, total summarize time ~5–8 minutes. Active CPU
+during summarization, ~80 % on one P-core. Don't expect to use the
+laptop interactively while it runs.
+
+#### Future wins
+
+- **CoreML execution provider for `ort`** (M3 roadmap). Today Parakeet
+  inference is CPU-only; enabling the CoreML EP routes it through the
+  Apple Neural Engine. Expected effect: ~5–10× faster transcription,
+  ~1.5 GB less RAM for the model, lower battery drain. Requires
+  building `ort` with the `coreml` feature and selecting the EP in
+  `Asr::new`. Drop-in once we have a production model artifact.
+- **VRAM-pinning for Ollama** via `OLLAMA_KEEP_ALIVE=0` to evict the
+  model after each summarize call. Trades startup latency for
+  baseline RAM. Worth a setting on 8 GB Macs.
+- **Background-queue summarization**: defer summarize calls until the
+  app detects low system pressure (no meeting recording, AC power).
+  Currently summarize is foreground-only.
 
 ---
 
@@ -435,7 +586,7 @@ changes in this file.
 ### M2 — Real transcription + product surface
 Driven by [`PRODUCT.md`](./PRODUCT.md). Suggested order:
 
-**M2a — Real ASR (foundation)**
+**M2a — Real ASR (foundation)** — step-by-step plan in [`M2A-PLAN.md`](./M2A-PLAN.md).
 - [ ] mic capture via `cpal` → 16 kHz f32 chunks. Tag chunks with
       `speaker_source = mic`.
 - [ ] system-audio capture via `screencapturekit` (macOS 13+). Tag chunks
@@ -479,6 +630,17 @@ Driven by [`PRODUCT.md`](./PRODUCT.md). Suggested order:
       hotkey.
 - [ ] Full-text search across transcripts + notes (SQLite FTS5,
       replaces the M2c LIKE-based notes search).
+- [ ] **CoreML execution provider for `ort`** — Parakeet via the Apple
+      Neural Engine. Single biggest perf win available; ~5–10× faster
+      ASR, ~1.5 GB less RAM, lower battery drain. See Performance →
+      Future wins.
+- [ ] **Background-queue summarization** — defer summarize calls until
+      the app detects low system pressure (no recording, AC power).
+      Lets long-meeting users hit "Stop" and walk away rather than
+      paying the 5–8 minute summarize cost interactively.
+- [ ] **8 GB-aware defaults** — detect available RAM at first launch
+      and surface the model-picker setting if Ollama 8B is going to
+      pressure swap (recommend qwen2.5:7b instead).
 
 ### M4 — Distribution
 - [ ] Replace placeholder icons (`pnpm tauri icon source.png`).
@@ -503,6 +665,20 @@ Driven by [`PRODUCT.md`](./PRODUCT.md). Suggested order:
   checklist line so the next person picks it up. Living scratch file —
   prune as items land. Don't treat it as durable spec; PRODUCT.md / this
   file are the durable docs.
+- **Trust boundaries in commit messages.** Any commit shipping code
+  whose target platform / dependency isn't reachable from your dev
+  environment should explicitly state what's verified by tests and
+  what's "trust me, this matches the spec." That way a future macOS
+  session knows the focal point for click-throughs. Bad: "M2a step 1
+  shipped." Good: "DSP path is unit-tested; cpal device handshake
+  needs macOS to verify and is added to HANDOFF.md."
+- **`#[allow(dead_code)]` is the cross-step bridge.** When you ship a
+  module in step N whose consumer arrives in step N+1, the symbols are
+  legitimately unused for one commit. Apply `#[allow(dead_code)]` at
+  the module or item level with a comment naming the next step that
+  removes it (`// Allowed until M2a step 3 wires this up`). Don't try
+  to silence the warnings via fake call sites or `pub` widening — both
+  rot.
 - **Svelte 5 gotchas** (each one ate a build cycle):
   - `onMount` callbacks must return a sync cleanup or nothing — never a
     `Promise<() => void>`. For async setup, fire-and-forget the promise

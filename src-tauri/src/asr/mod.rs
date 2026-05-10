@@ -2,15 +2,17 @@
 //!
 //! Parakeet is a streaming RNN-T / TDT model. Practically the pipeline is:
 //!   1. Buffer audio into ~480ms windows of 16 kHz mono f32.
-//!   2. Compute log-mel features (80 mel bins, 25ms window, 10ms hop).
+//!   2. Compute log-mel features (80 mel bins, 25ms window, 10ms hop) — see
+//!      [`mel`] (M2a step 2, shipped).
 //!   3. Run encoder ONNX → encoder embeddings.
 //!   4. Run joint/decoder ONNX with the previous prediction state to emit tokens.
 //!   5. Detokenize via the SentencePiece BPE that ships with the model.
 //!
-//! v1 of this module is a **stub** that compiles, exposes the public surface
-//! (`Asr::new`, `Asr::transcribe`), and documents what the full implementation
-//! must do. See CLAUDE.md → "Roadmap → ASR" for the export script and model
-//! files we expect on disk.
+//! Steps 1 and 2 are real; 3-5 are stubs pending model artifacts. See
+//! [`M2A-PLAN.md`](../../../M2A-PLAN.md) for the staging.
+
+pub mod mel;
+pub mod tokenizer;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
