@@ -105,9 +105,10 @@ Backend is ready for these — UI is the missing piece:
       mark `done`, keep saved segments and notes (PRODUCT.md M2b roadmap;
       currently a recording-status meeting after a crash will still be
       shown as "active").
-- [ ] **Vite-only `invoke` stub** for UI iteration without rebuilding Rust
-      (CLAUDE.md describes the pattern; left it for whoever wants the
-      faster loop).
+- [x] **Vite-only `invoke` stub** for UI iteration without rebuilding Rust
+      — shipped at `src/lib/api-stub.ts`. `pnpm dev` auto-routes to it
+      when there's no Tauri shell. State persists in `localStorage`;
+      `window.meetiorResetStub()` wipes it.
 
 ## Things to watch, not blocking
 

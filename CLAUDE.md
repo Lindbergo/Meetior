@@ -203,10 +203,23 @@ and a handful of correctness issues svelte-check waves through. Cheap
 
 ### UI-only iteration (no Tauri shell)
 
-When iterating on Svelte, run Vite alone and stub the backend in
-`src/lib/api.ts` behind a `import.meta.env.DEV && !window.__TAURI_INTERNALS__`
-guard so the UI renders with fake data. Faster than rebuilding Rust. Don't
-commit the stubs — guard them or keep them in a local dev branch.
+When iterating on Svelte (and on any non-macOS box), run Vite alone with
+`pnpm dev`. The IPC layer auto-routes to the in-memory stub in
+[`src/lib/api-stub.ts`](./src/lib/api-stub.ts) when `__TAURI_INTERNALS__`
+isn't on `window` — full UI flows work without macOS, ScreenCaptureKit,
+or Ollama. State persists to `localStorage`; reset via
+`window.meetiorResetStub()` in the devtools console.
+
+The stub mirrors the real backend's behavior: client color auto-assign,
+`delete_client` cascading to `client_id = NULL`, `start_meeting`
+replaying the same fixture transcript on its real timestamps, fake
+Ollama summary after a small delay, etc. It's not a substitute for
+macOS verification of mic / system-audio / ONNX paths, but for "does
+the UI hang together" it's enough.
+
+When you add a new Tauri command, add the matching handler to
+`api-stub.ts` in the same commit. The stub is the contract we ship for
+non-macOS development.
 
 ### Unit testing the backend
 

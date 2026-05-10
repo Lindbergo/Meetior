@@ -1,5 +1,38 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
+import { stubInvoke, stubListen, resetStub } from "./api-stub";
+
+// Pick the IPC layer once at module load. In `pnpm dev` (browser, no Tauri
+// shell) we route to the in-memory stub so UI iteration works without
+// macOS. In the real Tauri app `__TAURI_INTERNALS__` is set and the real
+// `invoke` / `listen` are used. CLAUDE.md → "UI-only iteration" describes
+// the rationale.
+const useStub =
+  import.meta.env.DEV &&
+  typeof window !== "undefined" &&
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  !(window as any).__TAURI_INTERNALS__;
+
+const invoke = <T>(cmd: string, args?: Record<string, unknown>): Promise<T> =>
+  useStub ? stubInvoke<T>(cmd, args) : tauriInvoke<T>(cmd, args);
+
+const listen = <T>(
+  event: string,
+  cb: (e: { payload: T }) => void,
+): Promise<UnlistenFn> =>
+  useStub
+    ? (stubListen(event, cb as (e: { payload: unknown }) => void) as Promise<UnlistenFn>)
+    : tauriListen<T>(event, cb);
+
+if (useStub && typeof window !== "undefined") {
+  // eslint-disable-next-line no-console
+  console.info(
+    "[meetior] Tauri shell not detected — using in-memory stub. " +
+      "Run `window.meetiorResetStub()` to wipe state.",
+  );
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (window as any).meetiorResetStub = resetStub;
+}
 
 export type MeetingStatus = "idle" | "recording" | "transcribing" | "summarizing" | "done" | "error";
 
