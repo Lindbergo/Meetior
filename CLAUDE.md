@@ -3,6 +3,10 @@
 This file is the durable brief for any Claude session that opens this repo.
 Read it first; update it when decisions change.
 
+For **what** we're building (product scope, data model, user journeys,
+behavior boundaries), see [`PRODUCT.md`](./PRODUCT.md). This file covers
+the **how**: stack, layout, conventions, and the build/test/iterate loop.
+
 ---
 
 ## What we're building
@@ -376,23 +380,46 @@ real, transcript segments will start flowing into the UI without changes here.
 - [x] Audio + ASR module stubs with clear contracts.
 - [x] Faux ASR fixture pipeline so the full UI flow runs without Parakeet.
 
-### M2 — Real transcription (manual start)
-- [ ] mic capture via `cpal` → 16 kHz f32 chunks.
-- [ ] system-audio capture via `screencapturekit` (macOS 13+).
+### M2 — Real transcription + product surface
+Driven by [`PRODUCT.md`](./PRODUCT.md). Suggested order:
+
+**M2a — Real ASR (foundation)**
+- [ ] mic capture via `cpal` → 16 kHz f32 chunks. Tag chunks with
+      `speaker_source = mic`.
+- [ ] system-audio capture via `screencapturekit` (macOS 13+). Tag chunks
+      `speaker_source = system`.
 - [ ] mel-spectrogram pre-processing.
 - [ ] Parakeet ONNX inference (encoder + decoder/joint, streaming).
-- [ ] Ship a `scripts/export-parakeet.py` for the model export step.
+      Propagate the source tag onto each emitted segment.
+- [ ] `scripts/export-parakeet.py` for the model export step.
+
+**M2b — Product surface around it**
+- [ ] `clients` table + Tauri commands (`create_client`, `list_clients`).
+      Sidebar UI with curated color palette.
+- [ ] Client picker in the Start dialog (existing / new / no client).
+- [ ] `notes` table + live notes pane in active-meeting view, with
+      timestamp + speaker-hint derived from recent dominant source.
+- [ ] `importer.rs` (symphonia) + `import_meeting` command + UI button.
+      Reject `.mp4`/`.mov` up front for v1.
+- [ ] Edit affordances: meeting title, client, summary text, todos
+      (add / delete / edit text). Transcript stays read-only.
+- [ ] Filter UI: client + date range chips. SQLite indexes only.
+- [ ] Cross-client digest view + `digest()` method on `summarizer.rs`.
+- [ ] Crash-recovery on launch: any meeting in `recording` status → mark
+      `done`, keep saved segments and notes.
 
 ### M3 — Auto-detect & polish
 - [ ] VAD-based "meeting started?" prompt.
-- [ ] Optionally: a tiny browser extension that pings the app when a Meet tab
-      is active. (Decided in initial requirements: defer to post-M2.)
-- [ ] Speaker diarization (Pyannote ONNX or lightweight clustering on
-      mic-vs-system tracks).
-- [ ] Settings UI: model picker, audio source toggles, hotkey.
+- [ ] Optional browser extension that pings the app when a Meet tab is
+      active. (Defer until M2 ships.)
+- [ ] Real speaker diarization (Pyannote ONNX). Replaces the "you vs them"
+      mic/system heuristic where it's confident.
+- [ ] Settings UI: retention policy, model picker, audio source toggles,
+      hotkey.
+- [ ] Full-text search across transcripts (SQLite FTS5).
 
 ### M4 — Distribution
-- [ ] Generate icons (`pnpm tauri icon`).
+- [ ] Replace placeholder icons (`pnpm tauri icon source.png`).
 - [ ] Notarize + DMG via `pnpm tauri build`.
 - [ ] First-run flow: download Parakeet ONNX from a release asset, verify
       checksum, place under app-data.
