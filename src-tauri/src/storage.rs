@@ -1,22 +1,34 @@
 //! SQLite-backed persistence.
 //!
-//! Schema is initialized on first open. We keep it deliberately small:
-//!   * `meetings` — one row per meeting
-//!   * `segments` — transcript segments, indexed by meeting_id + start_ms
-//!   * `summaries` — one summary per meeting
-//!   * `todos` — extracted todos
+//! Schema is initialized on first open and grows via additive migrations
+//! (new tables / new columns only). For the data model see PRODUCT.md →
+//! "Data model".
 //!
-//! All write paths run on a blocking thread via `tokio::task::spawn_blocking`
-//! at the call-site (or rusqlite's connection is used directly from sync code).
+//! Tables:
+//!   * `meetings`  — one row per meeting; FK to `clients` (nullable).
+//!   * `clients`   — first-class client/account entity (just name + color).
+//!   * `segments`  — transcript segments, indexed by meeting_id + idx.
+//!   * `notes`     — live notes the user typed during the meeting.
+//!   * `summaries` — one summary per meeting.
+//!   * `todos`     — extracted todos.
+//!
+//! Cascade rules:
+//!   * `meetings.client_id` → `clients.id` ON DELETE SET NULL — deleting a
+//!     client moves its meetings to "Unassigned" rather than nuking history.
+//!   * `segments`/`notes`/`summaries`/`todos`.meeting_id → `meetings.id`
+//!     ON DELETE CASCADE — deleting a meeting drops its child rows.
 
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::params;
+use rusqlite::{params, Connection};
 
-use crate::meeting::{Meeting, MeetingDetail, MeetingStatus, Todo, TranscriptSegment};
+use crate::meeting::{
+    Client, ClientColor, Meeting, MeetingDetail, MeetingSource, MeetingStatus, Note,
+    SpeakerHint, SpeakerSource, Todo, TranscriptSegment,
+};
 use crate::{Error, Result};
 
 pub struct Store {
@@ -41,20 +53,39 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS meetings (
+            "CREATE TABLE IF NOT EXISTS clients (
+                 id          TEXT PRIMARY KEY,
+                 name        TEXT NOT NULL,
+                 color       TEXT NOT NULL,
+                 created_at  TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS meetings (
                  id          TEXT PRIMARY KEY,
                  title       TEXT NOT NULL,
                  started_at  TEXT NOT NULL,
                  ended_at    TEXT,
-                 status      TEXT NOT NULL
+                 status      TEXT NOT NULL,
+                 client_id   TEXT REFERENCES clients(id) ON DELETE SET NULL,
+                 source      TEXT NOT NULL DEFAULT 'live'
              );
+             CREATE INDEX IF NOT EXISTS idx_meetings_started_at ON meetings(started_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_meetings_client_id ON meetings(client_id);
              CREATE TABLE IF NOT EXISTS segments (
-                 meeting_id  TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
-                 idx         INTEGER NOT NULL,
-                 start_ms    INTEGER NOT NULL,
-                 end_ms      INTEGER NOT NULL,
-                 speaker     TEXT,
-                 text        TEXT NOT NULL,
+                 meeting_id      TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                 idx             INTEGER NOT NULL,
+                 start_ms        INTEGER NOT NULL,
+                 end_ms          INTEGER NOT NULL,
+                 speaker         TEXT,
+                 speaker_source  TEXT NOT NULL DEFAULT 'unknown',
+                 text            TEXT NOT NULL,
+                 PRIMARY KEY (meeting_id, idx)
+             );
+             CREATE TABLE IF NOT EXISTS notes (
+                 meeting_id    TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                 idx           INTEGER NOT NULL,
+                 t_ms          INTEGER NOT NULL,
+                 speaker_hint  TEXT NOT NULL DEFAULT 'unknown',
+                 text          TEXT NOT NULL,
                  PRIMARY KEY (meeting_id, idx)
              );
              CREATE TABLE IF NOT EXISTS summaries (
@@ -70,20 +101,100 @@ impl Store {
                  created_at  TEXT NOT NULL
              );",
         )?;
+
+        // Forward-compatibility: if a database created by an earlier build
+        // is opened, top up the schema with columns added since.
+        ensure_column(&conn, "meetings", "client_id", "TEXT")?;
+        ensure_column(
+            &conn,
+            "meetings",
+            "source",
+            "TEXT NOT NULL DEFAULT 'live'",
+        )?;
+        ensure_column(
+            &conn,
+            "segments",
+            "speaker_source",
+            "TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // Clients
+    // ------------------------------------------------------------------
+
+    pub fn create_client(&self, name: &str) -> Result<Client> {
+        let used = self.list_clients()?.into_iter().map(|c| c.color).collect::<Vec<_>>();
+        let color = ClientColor::next_unused(&used);
+        let client = Client::new(name, color);
+        let conn = self.pool.get()?;
+        conn.execute(
+            "INSERT INTO clients (id, name, color, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![client.id, client.name, client.color.as_str(), client.created_at.to_rfc3339()],
+        )?;
+        Ok(client)
+    }
+
+    pub fn list_clients(&self) -> Result<Vec<Client>> {
+        let conn = self.pool.get()?;
+        let rows = conn
+            .prepare("SELECT id, name, color, created_at FROM clients ORDER BY name COLLATE NOCASE")?
+            .query_map([], row_to_client)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_client(&self, id: &str) -> Result<Client> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT id, name, color, created_at FROM clients WHERE id = ?1")?;
+        let client = stmt
+            .query_row(params![id], row_to_client)
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Error::NotFound(format!("client {id}")),
+                other => Error::Storage(other),
+            })?;
+        Ok(client)
+    }
+
+    pub fn update_client(&self, id: &str, name: &str, color: ClientColor) -> Result<Client> {
+        let conn = self.pool.get()?;
+        let updated = conn.execute(
+            "UPDATE clients SET name = ?2, color = ?3 WHERE id = ?1",
+            params![id, name, color.as_str()],
+        )?;
+        if updated == 0 {
+            return Err(Error::NotFound(format!("client {id}")));
+        }
+        self.get_client(id)
+    }
+
+    pub fn delete_client(&self, id: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        let n = conn.execute("DELETE FROM clients WHERE id = ?1", params![id])?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("client {id}")));
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Meetings
+    // ------------------------------------------------------------------
 
     pub fn insert_meeting(&self, m: &Meeting) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute(
-            "INSERT INTO meetings (id, title, started_at, ended_at, status)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO meetings (id, title, started_at, ended_at, status, client_id, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 m.id,
                 m.title,
                 m.started_at.to_rfc3339(),
                 m.ended_at.map(|t| t.to_rfc3339()),
                 status_str(m.status),
+                m.client_id,
+                meeting_source_str(m.source),
             ],
         )?;
         Ok(())
@@ -103,10 +214,34 @@ impl Store {
         self.get_meeting_row(id)
     }
 
+    /// Update editable fields. `client_id = Some(None)` is the wire format
+    /// for "unassign"; passing `None` here means "leave the field alone."
+    pub fn update_meeting(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        client_id: Option<Option<&str>>,
+    ) -> Result<Meeting> {
+        let conn = self.pool.get()?;
+        if let Some(t) = title {
+            conn.execute(
+                "UPDATE meetings SET title = ?2 WHERE id = ?1",
+                params![id, t],
+            )?;
+        }
+        if let Some(cid) = client_id {
+            conn.execute(
+                "UPDATE meetings SET client_id = ?2 WHERE id = ?1",
+                params![id, cid],
+            )?;
+        }
+        self.get_meeting_row(id)
+    }
+
     pub fn list_meetings(&self) -> Result<Vec<Meeting>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
-            "SELECT id, title, started_at, ended_at, status
+            "SELECT id, title, started_at, ended_at, status, client_id, source
              FROM meetings ORDER BY started_at DESC",
         )?;
         let rows = stmt
@@ -118,7 +253,8 @@ impl Store {
     fn get_meeting_row(&self, id: &str) -> Result<Meeting> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
-            "SELECT id, title, started_at, ended_at, status FROM meetings WHERE id = ?1",
+            "SELECT id, title, started_at, ended_at, status, client_id, source
+             FROM meetings WHERE id = ?1",
         )?;
         let m = stmt
             .query_row(params![id], row_to_meeting)
@@ -133,11 +269,16 @@ impl Store {
 
     pub fn get_meeting_detail(&self, id: &str) -> Result<MeetingDetail> {
         let meeting = self.get_meeting_row(id)?;
+        let client = match &meeting.client_id {
+            Some(cid) => Some(self.get_client(cid)?),
+            None => None,
+        };
+
         let conn = self.pool.get()?;
 
         let segments = conn
             .prepare(
-                "SELECT start_ms, end_ms, speaker, text FROM segments
+                "SELECT start_ms, end_ms, speaker, speaker_source, text FROM segments
                  WHERE meeting_id = ?1 ORDER BY idx ASC",
             )?
             .query_map(params![id], |r| {
@@ -145,6 +286,22 @@ impl Store {
                     start_ms: r.get::<_, i64>(0)? as u64,
                     end_ms: r.get::<_, i64>(1)? as u64,
                     speaker: r.get(2)?,
+                    speaker_source: parse_speaker_source(&r.get::<_, String>(3)?),
+                    text: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let notes = conn
+            .prepare(
+                "SELECT idx, t_ms, speaker_hint, text FROM notes
+                 WHERE meeting_id = ?1 ORDER BY idx ASC",
+            )?
+            .query_map(params![id], |r| {
+                Ok(Note {
+                    idx: r.get::<_, i64>(0)? as u32,
+                    t_ms: r.get::<_, i64>(1)? as u64,
+                    speaker_hint: parse_speaker_hint(&r.get::<_, String>(2)?),
                     text: r.get(3)?,
                 })
             })?
@@ -171,8 +328,19 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        Ok(MeetingDetail { meeting, segments, summary, todos })
+        Ok(MeetingDetail {
+            meeting,
+            client,
+            segments,
+            notes,
+            summary,
+            todos,
+        })
     }
+
+    // ------------------------------------------------------------------
+    // Segments
+    // ------------------------------------------------------------------
 
     pub fn append_segment(&self, meeting_id: &str, seg: &TranscriptSegment) -> Result<()> {
         let conn = self.pool.get()?;
@@ -184,19 +352,84 @@ impl Store {
             )
             .unwrap_or(0);
         conn.execute(
-            "INSERT INTO segments (meeting_id, idx, start_ms, end_ms, speaker, text)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO segments
+                 (meeting_id, idx, start_ms, end_ms, speaker, speaker_source, text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 meeting_id,
                 next_idx,
                 seg.start_ms as i64,
                 seg.end_ms as i64,
                 seg.speaker,
+                speaker_source_str(seg.speaker_source),
                 seg.text,
             ],
         )?;
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // Notes
+    // ------------------------------------------------------------------
+
+    /// Append a note line to a meeting. Returns the persisted Note (with
+    /// the assigned `idx`) so the caller can show it immediately.
+    pub fn append_note(
+        &self,
+        meeting_id: &str,
+        t_ms: u64,
+        speaker_hint: SpeakerHint,
+        text: &str,
+    ) -> Result<Note> {
+        let conn = self.pool.get()?;
+        let next_idx: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(idx) + 1, 0) FROM notes WHERE meeting_id = ?1",
+                params![meeting_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO notes (meeting_id, idx, t_ms, speaker_hint, text)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                meeting_id,
+                next_idx,
+                t_ms as i64,
+                speaker_hint_str(speaker_hint),
+                text,
+            ],
+        )?;
+        Ok(Note {
+            idx: next_idx as u32,
+            t_ms,
+            speaker_hint,
+            text: text.to_string(),
+        })
+    }
+
+    pub fn list_notes(&self, meeting_id: &str) -> Result<Vec<Note>> {
+        let conn = self.pool.get()?;
+        let rows = conn
+            .prepare(
+                "SELECT idx, t_ms, speaker_hint, text FROM notes
+                 WHERE meeting_id = ?1 ORDER BY idx ASC",
+            )?
+            .query_map(params![meeting_id], |r| {
+                Ok(Note {
+                    idx: r.get::<_, i64>(0)? as u32,
+                    t_ms: r.get::<_, i64>(1)? as u64,
+                    speaker_hint: parse_speaker_hint(&r.get::<_, String>(2)?),
+                    text: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // ------------------------------------------------------------------
+    // Summaries / todos
+    // ------------------------------------------------------------------
 
     pub fn save_summary(&self, meeting_id: &str, summary: &str, todos: &[Todo]) -> Result<()> {
         let mut conn = self.pool.get()?;
@@ -253,31 +486,57 @@ impl Store {
     }
 }
 
+// ----------------------------------------------------------------------
+// Row mapping + enum (de)serialization helpers
+// ----------------------------------------------------------------------
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !cols.iter().any(|c| c == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn row_to_meeting(r: &rusqlite::Row<'_>) -> rusqlite::Result<Meeting> {
     let started: String = r.get(2)?;
     let ended: Option<String> = r.get(3)?;
     let status: String = r.get(4)?;
+    let client_id: Option<String> = r.get(5)?;
+    let source: String = r.get(6)?;
     Ok(Meeting {
         id: r.get(0)?,
         title: r.get(1)?,
-        started_at: DateTime::parse_from_rfc3339(&started)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?
-            .with_timezone(&Utc),
-        ended_at: ended
-            .map(|s| {
-                DateTime::parse_from_rfc3339(&s)
-                    .map(|d| d.with_timezone(&Utc))
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })
-            })
-            .transpose()?,
+        started_at: parse_ts(&started, 2)?,
+        ended_at: ended.map(|s| parse_ts(&s, 3)).transpose()?,
         status: parse_status(&status),
+        client_id,
+        source: parse_meeting_source(&source),
     })
+}
+
+fn row_to_client(r: &rusqlite::Row<'_>) -> rusqlite::Result<Client> {
+    let created: String = r.get(3)?;
+    Ok(Client {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        color: ClientColor::from_str(&r.get::<_, String>(2)?).unwrap_or(ClientColor::Gray),
+        created_at: parse_ts(&created, 3)?,
+    })
+}
+
+fn parse_ts(s: &str, col: usize) -> rusqlite::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|d| d.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, Box::new(e))
+        })
 }
 
 fn status_str(s: MeetingStatus) -> &'static str {
@@ -302,18 +561,64 @@ fn parse_status(s: &str) -> MeetingStatus {
     }
 }
 
+fn meeting_source_str(s: MeetingSource) -> &'static str {
+    match s {
+        MeetingSource::Live => "live",
+        MeetingSource::Imported => "imported",
+    }
+}
+
+fn parse_meeting_source(s: &str) -> MeetingSource {
+    match s {
+        "imported" => MeetingSource::Imported,
+        _ => MeetingSource::Live,
+    }
+}
+
+fn speaker_source_str(s: SpeakerSource) -> &'static str {
+    match s {
+        SpeakerSource::Mic => "mic",
+        SpeakerSource::System => "system",
+        SpeakerSource::Unknown => "unknown",
+    }
+}
+
+fn parse_speaker_source(s: &str) -> SpeakerSource {
+    match s {
+        "mic" => SpeakerSource::Mic,
+        "system" => SpeakerSource::System,
+        _ => SpeakerSource::Unknown,
+    }
+}
+
+fn speaker_hint_str(h: SpeakerHint) -> &'static str {
+    match h {
+        SpeakerHint::You => "you",
+        SpeakerHint::Them => "them",
+        SpeakerHint::Unknown => "unknown",
+    }
+}
+
+fn parse_speaker_hint(s: &str) -> SpeakerHint {
+    match s {
+        "you" => SpeakerHint::You,
+        "them" => SpeakerHint::Them,
+        _ => SpeakerHint::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::meeting::Meeting;
 
     fn store() -> Store {
-        // Per-test temp file — simpler than juggling SQLite URI memory mode
-        // through r2d2. Cleaned up automatically when the test process exits.
         let path = std::env::temp_dir()
             .join(format!("meetior_test_{}.sqlite", uuid::Uuid::new_v4()));
         Store::open(path).unwrap()
     }
+
+    // --- meetings + segments + summary + todos -------------------------
 
     #[test]
     fn round_trips_a_meeting() {
@@ -324,6 +629,8 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].title, "standup");
         assert_eq!(listed[0].status, MeetingStatus::Recording);
+        assert!(listed[0].client_id.is_none());
+        assert_eq!(listed[0].source, MeetingSource::Live);
     }
 
     #[test]
@@ -338,6 +645,7 @@ mod tests {
                     start_ms: (i * 1000) as u64,
                     end_ms: (i * 1000 + 800) as u64,
                     speaker: Some("Alice".into()),
+                    speaker_source: SpeakerSource::Unknown,
                     text: (*text).into(),
                 },
             )
@@ -391,5 +699,142 @@ mod tests {
             .unwrap();
         assert_eq!(updated.status, MeetingStatus::Done);
         assert!(updated.ended_at.is_some());
+    }
+
+    // --- clients --------------------------------------------------------
+
+    #[test]
+    fn create_client_auto_assigns_first_palette_color() {
+        let s = store();
+        let c = s.create_client("Acme Corp").unwrap();
+        assert_eq!(c.name, "Acme Corp");
+        assert_eq!(c.color, ClientColor::Red);
+    }
+
+    #[test]
+    fn create_client_skips_used_colors() {
+        let s = store();
+        let _ = s.create_client("Acme").unwrap();
+        let c = s.create_client("Foo Inc").unwrap();
+        assert_eq!(c.color, ClientColor::Orange);
+    }
+
+    #[test]
+    fn list_clients_sorted_by_name_case_insensitive() {
+        let s = store();
+        s.create_client("zebra").unwrap();
+        s.create_client("Alpha").unwrap();
+        s.create_client("middle").unwrap();
+        let names: Vec<_> = s.list_clients().unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["Alpha", "middle", "zebra"]);
+    }
+
+    #[test]
+    fn update_client_changes_name_and_color() {
+        let s = store();
+        let c = s.create_client("Acme").unwrap();
+        let updated = s.update_client(&c.id, "Acme Corp", ClientColor::Indigo).unwrap();
+        assert_eq!(updated.name, "Acme Corp");
+        assert_eq!(updated.color, ClientColor::Indigo);
+    }
+
+    #[test]
+    fn delete_client_nullifies_meeting_client_id() {
+        let s = store();
+        let client = s.create_client("Acme").unwrap();
+        let m = Meeting::new("kickoff").with_client(Some(client.id.clone()));
+        s.insert_meeting(&m).unwrap();
+
+        s.delete_client(&client.id).unwrap();
+
+        let listed = s.list_meetings().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].client_id.is_none(),
+                "deleting a client should set meeting.client_id to NULL, not delete the meeting");
+    }
+
+    #[test]
+    fn get_meeting_detail_includes_client_when_assigned() {
+        let s = store();
+        let client = s.create_client("Acme").unwrap();
+        let m = Meeting::new("kickoff").with_client(Some(client.id.clone()));
+        s.insert_meeting(&m).unwrap();
+
+        let detail = s.get_meeting_detail(&m.id).unwrap();
+        assert_eq!(detail.client.as_ref().map(|c| c.name.as_str()), Some("Acme"));
+    }
+
+    #[test]
+    fn update_meeting_changes_title_and_client() {
+        let s = store();
+        let c = s.create_client("Acme").unwrap();
+        let m = Meeting::new("draft title");
+        s.insert_meeting(&m).unwrap();
+
+        let updated = s
+            .update_meeting(&m.id, Some("real title"), Some(Some(c.id.as_str())))
+            .unwrap();
+        assert_eq!(updated.title, "real title");
+        assert_eq!(updated.client_id.as_deref(), Some(c.id.as_str()));
+
+        // Unassign by passing Some(None).
+        let unassigned = s.update_meeting(&m.id, None, Some(None)).unwrap();
+        assert!(unassigned.client_id.is_none());
+        assert_eq!(unassigned.title, "real title", "title should be unchanged");
+    }
+
+    // --- notes ----------------------------------------------------------
+
+    #[test]
+    fn append_note_increments_idx() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+
+        let n1 = s.append_note(&m.id, 1500, SpeakerHint::You, "first thought").unwrap();
+        let n2 = s.append_note(&m.id, 4200, SpeakerHint::Them, "client said X").unwrap();
+
+        assert_eq!(n1.idx, 0);
+        assert_eq!(n2.idx, 1);
+        assert_eq!(n1.speaker_hint, SpeakerHint::You);
+        assert_eq!(n2.speaker_hint, SpeakerHint::Them);
+    }
+
+    #[test]
+    fn list_notes_returns_in_idx_order_and_meeting_detail_includes_them() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+        s.append_note(&m.id, 1000, SpeakerHint::You, "a").unwrap();
+        s.append_note(&m.id, 2000, SpeakerHint::Them, "b").unwrap();
+        s.append_note(&m.id, 3000, SpeakerHint::Unknown, "c").unwrap();
+
+        let listed = s.list_notes(&m.id).unwrap();
+        let texts: Vec<_> = listed.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "b", "c"]);
+
+        let detail = s.get_meeting_detail(&m.id).unwrap();
+        assert_eq!(detail.notes.len(), 3);
+        assert_eq!(detail.notes[1].text, "b");
+    }
+
+    #[test]
+    fn deleting_meeting_cascades_to_notes() {
+        let s = store();
+        let m = Meeting::new("test");
+        s.insert_meeting(&m).unwrap();
+        s.append_note(&m.id, 0, SpeakerHint::You, "note").unwrap();
+
+        let conn = s.pool.get().unwrap();
+        conn.execute("DELETE FROM meetings WHERE id = ?1", params![m.id]).unwrap();
+
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes WHERE meeting_id = ?1",
+                params![m.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0);
     }
 }

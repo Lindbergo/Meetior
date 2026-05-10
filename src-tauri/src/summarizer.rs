@@ -161,6 +161,7 @@ mod tests {
             start_ms: 0,
             end_ms: 1000,
             speaker: Some("Alice".into()),
+            speaker_source: crate::meeting::SpeakerSource::Unknown,
             text: text.into(),
         }
     }
